@@ -24,6 +24,7 @@ Not in the plugin market yet; install it as a local development plugin, then res
 | `priceFeeds` | {} | Preset `provider → pricing-page URL`; the panel input wins. |
 | `usdToCny` | 7.1 | Rate for USD prices found on generic pages. |
 | `peakHolidays` | [] | Dates (`YYYY-MM-DD`, UTC+8) treated as off-peak. |
+| `utcOffsetHours` | 8 | Offset in hours for peak windows and daily buckets (-12..14), 0 = UTC; existing buckets are not re-keyed. |
 | `pricing` | {} | Custom price table keyed by `provider`, `provider/model` or `*`; overrides official prices, all zeros = unpriced. |
 
 Resolution order: **custom `pricing` → official table → built-in estimate**.
@@ -32,16 +33,15 @@ Resolution order: **custom `pricing` → official table → built-in estimate**.
 
 - Data directory: `$DSH_HOME/llm-usage-insights/` (default `~/.dsh/llm-usage-insights`).
 - `usage.json` stores counters, tokens and price sources only — **no prompt or reply content**.
-- Writes are atomic (temp file + rename); failures keep a dirty flag and retry.
+- Writes take `usage.lock` for a short critical section, merge on-disk buckets (field-wise max), then write atomically; failures keep a dirty flag and retry.
 - HTTP routes are loopback / same-origin only.
 
 ## Known limitations
 
 - Auto-discovery needs the host search service (desktop requires a DeepSeek API key).
 - Official-page scraping covers **SiliconFlow** and **DeepSeek official** layouts only.
-- Peak/off-peak is fixed to UTC+8.
-- No multi-instance lock on `usage.json`.
-- No CSV / JSON export yet.
+- Peak/off-peak and daily buckets follow `utcOffsetHours`; changing it does not re-key existing buckets.
+- `usage.json` has a lightweight `usage.lock`, but two instances can only merge buckets field-by-field (max), so concurrent calls in the same hour may be undercounted — keep one window open. No JSON export yet (CSV is available).
 
 ## Test
 

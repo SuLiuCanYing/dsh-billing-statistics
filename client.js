@@ -141,6 +141,8 @@ window.__ModuleLoader__.load({
         empty: '还没有记录到模型调用。',
         emptyHint: '在这个 Harness 里发起一次对话（或让子代理、标题生成等调用模型），数据会出现在这里。',
         footerRetention: '按天明细保留 {days} 天。',
+      exportCsv: '导出 CSV',
+      exportHint: '按天明细导出成 CSV（含合计行），Excel 可直接打开。',
         footerPrice: '价格在「设置 → 插件 → llm-usage-insights」的配置 pricing 里改；也可写进 profile 的 {file}。',
         footerFile: '数据文件：$DSH_HOME/{file}',
       },
@@ -266,6 +268,8 @@ window.__ModuleLoader__.load({
         empty: 'No model calls recorded yet.',
         emptyHint: 'Send a message in this Harness (or let a subagent or title generator call a model) and the numbers appear here.',
         footerRetention: 'Daily buckets are kept for {days} days.',
+      exportCsv: 'Export CSV',
+      exportHint: 'Export the daily breakdown as CSV (with a totals row); opens directly in Excel.',
         footerPrice: 'Edit rates under Settings → Plugins → llm-usage-insights (config "pricing"), or in the profile {file}.',
         footerFile: 'Data file: $DSH_HOME/{file}',
       },
@@ -441,6 +445,8 @@ window.__ModuleLoader__.load({
 }
 .llmu-error { border-color: var(--dsw-alias-state-error-primary); color: var(--dsw-alias-state-error-primary); }
 .llmu-foot { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; font-size: 11px; color: var(--dsw-alias-label-secondary); line-height: 1.6; }
+.llmu-export { color: var(--dsw-alias-label-primary); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.llmu-export:hover { color: var(--dsw-alias-brand-primary); }
 .llmu-trend {
   display: flex; flex-direction: column; gap: 8px; padding: 12px 14px;
   border: 1px solid var(--dsw-alias-border-l1); border-radius: 10px; background: var(--dsw-alias-bg-layer-1);
@@ -1682,6 +1688,16 @@ window.__ModuleLoader__.load({
           'div',
           { className: 'llmu-foot' },
           h('span', null, t('footerRetention', { days: summary.retainDays })),
+          h(
+            'a',
+            {
+              className: 'llmu-export',
+              href: `${API_BASE}/export.csv?days=${summary.days}`,
+              download: `llm-usage-${summary.from ?? 'export'}.csv`,
+              title: t('exportHint'),
+            },
+            t('exportCsv'),
+          ),
           showCost ? h('span', null, t('footerPrice', { file: 'cordis.patch.yml' })) : null,
           h('span', null, t('footerFile', { file: 'llm-usage-insights/usage.json' })),
         ),

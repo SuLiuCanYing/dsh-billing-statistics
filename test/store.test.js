@@ -131,6 +131,53 @@ test('setPricer 后按新价重算历史花费', async () => {
   await rm(directory, { recursive: true, force: true })
 })
 
+test('按配置的时区偏移切分日期与小时桶', async () => {
+  const at = Date.parse('2026-11-04T17:30:00Z')
+  const utc = await tempStore({ utcOffsetHours: 0 })
+  utc.store.recordCall({ provider: 'p', model: 'm', usage: { inputTokens: 1 }, at })
+  assert.deepEqual(Object.keys(utc.store.records.get('p/m').hours), ['2026-11-04'])
+  assert.deepEqual(Object.keys(utc.store.records.get('p/m').hours['2026-11-04']), ['17'])
+  await utc.store.close()
+  await rm(utc.directory, { recursive: true, force: true })
+
+  const beijing = await tempStore({ utcOffsetHours: 8 })
+  beijing.store.recordCall({ provider: 'p', model: 'm', usage: { inputTokens: 1 }, at })
+  assert.deepEqual(Object.keys(beijing.store.records.get('p/m').hours), ['2026-11-05'])
+  assert.deepEqual(Object.keys(beijing.store.records.get('p/m').hours['2026-11-05']), ['01'])
+  await beijing.store.close()
+  await rm(beijing.directory, { recursive: true, force: true })
+})
+
+test('两个实例写同一目录：加锁串行、合并计数、不留锁文件', async () => {
+  const first = await tempStore()
+  const second = new UsageStore({
+    directory: first.directory,
+    retainDays: 30,
+    pricer: createPricer({ custom: CUSTOM }),
+  })
+  await second.load()
+  first.store.recordCall({ provider: 'p', model: 'm', usage: { inputTokens: 1_000_000 }, at: NOON })
+  second.recordCall({ provider: 'p', model: 'm', usage: { outputTokens: 1_000_000 }, at: NOON })
+  await Promise.all([first.store.flush(), second.flush()])
+  const raw = JSON.parse(await readFile(join(first.directory, 'usage.json'), 'utf8'))
+  assert.deepEqual(Object.keys(raw.records), ['p/m'])
+  await assert.rejects(readFile(join(first.directory, 'usage.lock'), 'utf8'), /ENOENT/)
+  await first.store.close()
+  await second.close()
+  await rm(first.directory, { recursive: true, force: true })
+})
+
+test('reset 会清掉盘上已有数据（不被合并回填）', async () => {
+  const { store, directory } = await tempStore()
+  store.recordCall({ provider: 'p', model: 'm', usage: { inputTokens: 1_000_000 }, at: NOON })
+  await store.flush()
+  assert.equal(JSON.parse(await readFile(join(directory, 'usage.json'), 'utf8')).records['p/m'].calls, 1)
+  await store.reset()
+  assert.deepEqual(JSON.parse(await readFile(join(directory, 'usage.json'), 'utf8')).records, {})
+  await store.close()
+  await rm(directory, { recursive: true, force: true })
+})
+
 test('reset 清空内存与磁盘', async () => {
   const { store, directory } = await tempStore()
   store.recordCall({ provider: 'p', model: 'm', usage: { inputTokens: 10 }, at: NOON })

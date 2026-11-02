@@ -1,7 +1,21 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { computeCost, createPricer, normalizeRate, normalizeUsage, rateAt, SOURCE_CUSTOM, SOURCE_ESTIMATE, SOURCE_NONE, SOURCE_OFFICIAL } from '../pricing.js'
+import {
+  beijingParts,
+  computeCost,
+  createPricer,
+  dayKey,
+  normalizeOffsetHours,
+  normalizeRate,
+  normalizeUsage,
+  offsetZone,
+  rateAt,
+  SOURCE_CUSTOM,
+  SOURCE_ESTIMATE,
+  SOURCE_NONE,
+  SOURCE_OFFICIAL,
+} from '../pricing.js'
 
 const PEAK = { input: 2, output: 8, cacheRead: 0.04, cacheWrite: 0 }
 const OFF = { input: 1, output: 4, cacheRead: 0.02, cacheWrite: 0 }
@@ -112,3 +126,32 @@ test('normalizeUsage / normalizeRate：负数与非法值一律归零', () => {
   assert.equal(usage.totalTokens, 120)
   assert.deepEqual(normalizeRate({ input: -1, output: 'x', cacheRead: 0.5 }), { input: 0, output: 0, cacheRead: 0.5, cacheWrite: 0 })
 })
+
+test('时区偏移：beijingParts / dayKey / rateAt 都按传入偏移切分', () => {
+  const at = Date.parse('2026-11-04T17:30:00Z')
+  assert.equal(beijingParts(at).dayKey, '2026-11-05')
+  assert.equal(beijingParts(at).hour, 1)
+  assert.equal(beijingParts(at, 0).dayKey, '2026-11-04')
+  assert.equal(beijingParts(at, 0).hour, 17)
+  assert.equal(dayKey(at), '2026-11-05')
+  assert.equal(dayKey(at, 0), '2026-11-04')
+  assert.equal(normalizeOffsetHours('abc'), 8)
+  assert.equal(normalizeOffsetHours(-20), -12)
+  assert.equal(offsetZone(8), '+08:00')
+  assert.equal(offsetZone(-3.5), '-03:30')
+
+  const rule = {
+    source: 'official',
+    currency: 'CNY',
+    periods: [
+      { label: '峰', ranges: [[9, 18]], rate: { input: 8, output: 16, cacheRead: 0, cacheWrite: 0 } },
+      { label: '谷', ranges: [[18, 24]], rate: { input: 4, output: 8, cacheRead: 0, cacheWrite: 0 } },
+    ],
+    tiers: [],
+  }
+  const tenUtc = Date.parse('2026-11-04T10:00:00Z')
+  assert.equal(rateAt(rule, tenUtc, 0, 0).label, '峰')
+  assert.equal(rateAt(rule, tenUtc, 0, 8).label, '谷')
+  assert.equal(rateAt(rule, tenUtc, 0, 8).rate.input, 4)
+})
+

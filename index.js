@@ -15,7 +15,8 @@ import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { UsageStore } from './usage-store.js'
-import { SOURCE_NONE, beijingParts, createPricer } from './pricing.js'
+import { SOURCE_NONE, beijingParts, createPricer, normalizeOffsetHours } from './pricing.js'
+import { buildCsv } from './export-csv.js'
 import { discoverPriceUrl, fetchPricePage, knownFeedFor } from './price-source.js'
 
 /** 路由前缀；页面就按这个路径取数。 */
@@ -25,6 +26,7 @@ const RESET_PATH = `${API_PREFIX}/reset`
 const PRICES_PATH = `${API_PREFIX}/prices`
 const PRICES_SYNC_PATH = `${API_PREFIX}/prices/sync`
 const SOURCES_PATH = `${API_PREFIX}/sources`
+const EXPORT_PATH = `${API_PREFIX}/export.csv`
 const MODEL_PATH = `${API_PREFIX}/model`
 
 const rateSchema = Schema.object({
@@ -63,6 +65,14 @@ export const Config = Schema.object({
     .description(
       '视为「空闲时段」的日期（YYYY-MM-DD，北京时间），用于 DeepSeek 这类工作日峰谷价。 Dates (YYYY-MM-DD, UTC+8) treated as off-peak, e.g. Chinese public holidays. ' +
         '中国法定节假日可填在这里，避免节假日按高峰价估算。',
+    ),
+  utcOffsetHours: Schema.number()
+    .min(-12)
+    .max(14)
+    .default(8)
+    .description(
+      '峰谷时段与「按天」分桶使用的时区偏移（小时），默认 8 即北京时间。 Timezone offset in hours used for peak windows and daily buckets; 8 = UTC+8 (Beijing). ' +
+        '填 0 表示 UTC，填 9 表示东京；数据文件里已有的分桶不会重排。 Existing buckets are not re-keyed when this changes.',
     ),
   pricing: Schema.dict(rateSchema)
     .default({})
@@ -247,8 +257,12 @@ async function writeJsonFile(file, payload) {
 }
 
 /** 今天（北京时间）；自动同步按这个粒度判断「今天抓过没有」。 */
-function todayKey() {
-  return beijingParts(Date.now()).dayKey
+function utcOffset(config) {
+  return normalizeOffsetHours(config?.utcOffsetHours)
+}
+
+function todayKey(config) {
+  return beijingParts(Date.now(), utcOffset(config)).dayKey
 }
 
 /** 某个平台当前用的官网链接（手填 > 配置预设 > 已知平台默认页）。 */
@@ -302,9 +316,9 @@ function priceReport({ snapshot, config, sources, providers, names }) {
     autoDiscover: config?.autoDiscover !== false,
     fetchedAt: Number(snapshot?.fetchedAt) || 0,
     day,
-    today: todayKey(),
-    syncedToday: day === todayKey(),
-    stale: day !== todayKey(),
+    today: todayKey(config),
+    syncedToday: day === todayKey(config),
+    stale: day !== todayKey(config),
     providers: entries,
     errors,
   }
@@ -435,7 +449,7 @@ function createPriceSync({ ctx, config, file, sourcesFile, store, state }) {
     const snapshot = {
       version: 2,
       fetchedAt: anyOk ? Date.now() : Number(state.snapshot?.fetchedAt) || 0,
-      day: anyOk ? todayKey() : (state.snapshot?.day ?? ''),
+      day: anyOk ? todayKey(config) : (state.snapshot?.day ?? ''),
       providers: table,
       errors: errors.slice(0, 12),
     }
@@ -479,6 +493,7 @@ function rebuildPricer({ config, state, store }) {
     providers,
     holidays: Array.isArray(config?.peakHolidays) ? config.peakHolidays : [],
     usdToCny: Number(config?.usdToCny) || 7.1,
+    utcOffsetHours: utcOffset(config),
   })
   store.setPricer(pricer)
   return pricer
@@ -498,8 +513,13 @@ export function apply(ctx, config) {
 
   const store = new UsageStore({
     directory,
-    retainDays: config?.retainDays ?? 90,
-    pricer: createPricer({ custom: config?.pricing ?? {}, holidays: config?.peakHolidays ?? [] }),
+    retainDays: config?.retainDays ?? 30,
+    utcOffsetHours: utcOffset(config),
+    pricer: createPricer({
+      custom: config?.pricing ?? {},
+      holidays: config?.peakHolidays ?? [],
+      utcOffsetHours: utcOffset(config),
+    }),
     listProviders: () => providerDirectory(ctx),
     showCost: config?.showCost !== false,
     logger: ctx.logger,
@@ -521,7 +541,7 @@ export function apply(ctx, config) {
       ctx.logger?.info?.(`llm-usage: 计量已就绪，数据目录 ${store.directory}`)
       if (config?.priceSync === false) return
       // 每天自动抓一次：今天没抓过（含「当时程序没开」）就在启动时补上。
-      if (state.snapshot?.day !== todayKey()) {
+      if (state.snapshot?.day !== todayKey(config)) {
         void syncPrices().catch((error) => {
           ctx.logger?.warn?.(`llm-usage: 启动时同步价格失败：${String(error?.message ?? error)}`)
         })
@@ -537,7 +557,7 @@ export function apply(ctx, config) {
     // 程序跨天常开时，新的一天也会补抓一次（每半小时看一眼，抓过就跳过）。
     const dailyTimer = setInterval(() => {
       if (config?.priceSync === false) return
-      if (state.snapshot?.day === todayKey()) return
+      if (state.snapshot?.day === todayKey(config)) return
       void syncPrices().catch((error) => {
         ctx.logger?.warn?.(`llm-usage: 每日同步价格失败：${String(error?.message ?? error)}`)
       })
@@ -593,6 +613,22 @@ export function apply(ctx, config) {
               names: store.platformNames(),
             }),
           })
+          return
+        }
+        if (pathname === EXPORT_PATH) {
+          if (request.method !== 'GET' && request.method !== 'HEAD') {
+            response.writeHead(405, { allow: 'GET' })
+            response.end()
+            return
+          }
+          const csv = buildCsv(store.summary({ days: parseDays(request) }), { generatedAt: Date.now() })
+          response.writeHead(200, {
+            'content-type': 'text/csv; charset=utf-8',
+            'content-disposition': `attachment; filename="llm-usage-${todayKey(config)}.csv"`,
+            'cache-control': 'no-store',
+          })
+          // BOM：Excel 双击打开不乱码。
+          response.end(request.method === 'HEAD' ? undefined : `\ufeff${csv}`)
           return
         }
         if (pathname === RESET_PATH) {
@@ -688,7 +724,7 @@ export function apply(ctx, config) {
     }
     const disposes = []
     try {
-      for (const path of [SUMMARY_PATH, RESET_PATH, MODEL_PATH, PRICES_PATH, PRICES_SYNC_PATH, SOURCES_PATH]) {
+      for (const path of [SUMMARY_PATH, EXPORT_PATH, RESET_PATH, MODEL_PATH, PRICES_PATH, PRICES_SYNC_PATH, SOURCES_PATH]) {
         disposes.push(ctx.webServer.register({ kind: 'exact', path, handler }))
       }
     } catch (error) {

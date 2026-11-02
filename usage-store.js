@@ -11,9 +11,19 @@
  * 写失败只记录日志，不阻塞模型调用。
  */
 
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import { dayKey, dayKeyBefore, isComplexRule, normalizeUsage, rateAt, SOURCE_NONE } from './pricing.js'
+import {
+  beijingParts,
+  dayKey,
+  dayKeyBefore,
+  isComplexRule,
+  normalizeOffsetHours,
+  normalizeUsage,
+  offsetZone,
+  rateAt,
+  SOURCE_NONE,
+} from './pricing.js'
 
 export const FILE_VERSION = 2
 
@@ -70,6 +80,33 @@ function numbersOf(value) {
 
 function emptyBucket() {
   return { calls: 0, failed: 0, aborted: 0, tokens: emptyTokens(), cost: 0, peakCost: 0 }
+}
+
+/** 合并另一份记录的小时桶：逐字段取大（两实例互相覆盖时宁可少算，也不重复计数）。 */
+function mergeMaxInto(target, incoming) {
+  for (const [day, buckets] of Object.entries(incoming.hours ?? {})) {
+    const mine = (target.hours[day] = target.hours[day] ?? {})
+    for (const [hour, bucket] of Object.entries(buckets)) {
+      const current = (mine[hour] = mine[hour] ?? emptyBucket())
+      for (const key of ['calls', 'failed', 'aborted', 'cost', 'peakCost']) {
+        current[key] = Math.max(current[key] ?? 0, bucket[key] ?? 0)
+      }
+      for (const key of ['input', 'output', 'cacheRead', 'cacheWrite', 'reasoning', 'total']) {
+        current.tokens[key] = Math.max(current.tokens[key] ?? 0, bucket.tokens?.[key] ?? 0)
+      }
+      current.tokens.prompt = current.tokens.input + current.tokens.cacheRead + current.tokens.cacheWrite
+      current.tokens.total = current.tokens.prompt + current.tokens.output
+    }
+  }
+  if (incoming.firstCall > 0) {
+    target.firstCall = target.firstCall > 0 ? Math.min(target.firstCall, incoming.firstCall) : incoming.firstCall
+  }
+  target.lastCall = Math.max(target.lastCall ?? 0, incoming.lastCall ?? 0)
+}
+
+/** 文件锁的等待节奏（毫秒）。 */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function addInto(target, delta) {
@@ -158,7 +195,9 @@ export class UsageStore {
   constructor(options) {
     this.directory = options.directory
     this.file = join(options.directory, 'usage.json')
-    this.retainDays = Math.max(1, Math.floor(Number(options.retainDays) || 90))
+    this.retainDays = Math.max(1, Math.floor(Number(options.retainDays) || 30))
+    this.utcOffsetHours = normalizeOffsetHours(options.utcOffsetHours)
+    this.lockFile = join(options.directory, 'usage.lock')
     this.pricer = options.pricer
     this.listProviders = options.listProviders ?? (() => [])
     this.showCost = options.showCost !== false
@@ -204,11 +243,16 @@ export class UsageStore {
     }
     this.loadedAt = Date.now()
     this.prune()
+    // 同一数据目录被两个实例同时打开时，两个进程都各自记账：写盘靠锁互斥，
+    // 但计数只能「逐字段取大」合并，所以这里明确告警一次。
+    if (!(await this.lockIsStale())) {
+      this.logger?.warn?.('llm-usage: 检测到另一个实例正在使用同一数据目录，同时写入的调用可能被少算（建议只开一个窗口）')
+    }
   }
 
   /** 删掉超出保留期的小时桶，并重算总计，避免总量随裁剪漂移。 */
   prune() {
-    const cutoff = dayKeyBefore(this.retainDays - 1)
+    const cutoff = dayKeyBefore(this.retainDays - 1, Date.now(), this.utcOffsetHours)
     let removed = 0
     for (const record of this.records.values()) {
       for (const day of Object.keys(record.hours)) {
@@ -241,10 +285,11 @@ export class UsageStore {
     for (const [day, buckets] of Object.entries(record.hours)) {
       for (const [hour, bucket] of Object.entries(buckets)) {
         addInto(totals, bucket)
+        const zone = offsetZone(this.utcOffsetHours)
         if (totals.firstCall === 0 && bucket.calls > 0) {
-          totals.firstCall = Date.parse(`${day}T${hour}:00:00+08:00`) || totals.firstCall
+          totals.firstCall = Date.parse(`${day}T${hour}:00:00${zone}`) || totals.firstCall
         }
-        const at = Date.parse(`${day}T${hour}:59:59+08:00`)
+        const at = Date.parse(`${day}T${hour}:59:59${zone}`)
         if (Number.isFinite(at) && at > totals.lastCall) totals.lastCall = at
       }
     }
@@ -307,8 +352,8 @@ export class UsageStore {
     record.price = { source, currency }
     addInto(record, delta)
 
-    const day = dayKey(at)
-    const hour = String(new Date(at + 8 * 3600 * 1000).getUTCHours()).padStart(2, '0')
+    const day = dayKey(at, this.utcOffsetHours)
+    const hour = String(beijingParts(at, this.utcOffsetHours).hour).padStart(2, '0')
     const buckets = (record.hours[day] = record.hours[day] ?? {})
     const bucket = (buckets[hour] = buckets[hour] ?? emptyBucket())
     addInto(bucket, delta)
@@ -329,10 +374,10 @@ export class UsageStore {
       for (const [day, buckets] of Object.entries(record.hours)) {
         for (const [hour, bucket] of Object.entries(buckets)) {
           if (bucket.tokens.total === 0 && bucket.calls === 0) continue
-          const at = Date.parse(`${day}T${hour}:00:00+08:00`)
+          const at = Date.parse(`${day}T${hour}:00:00${offsetZone(this.utcOffsetHours)}`)
           if (!Number.isFinite(at)) continue
           const promptTokens = bucket.tokens.input + bucket.tokens.cacheRead + bucket.tokens.cacheWrite
-          const picked = rateAt(rule, at, promptTokens)
+          const picked = rateAt(rule, at, promptTokens, this.utcOffsetHours)
           const cost =
             (bucket.tokens.input * picked.rate.input +
               bucket.tokens.output * picked.rate.output +
@@ -373,23 +418,111 @@ export class UsageStore {
     this.flushChain = this.flushChain.then(async () => {
       if (!this.dirty) return
       this.dirty = false
-      const payload = {
-        version: FILE_VERSION,
-        updatedAt: this.updatedAt,
-        records: Object.fromEntries(this.records),
-      }
-      const text = JSON.stringify(payload)
-      const temporary = `${this.file}.tmp`
+      let locked = false
       try {
+        locked = await this.acquireLock()
+        if (!locked) {
+          // 另一个实例正握着锁：这次不写盘，保留脏标记，稍后重试，避免覆盖它刚写入的数据。
+          this.dirty = true
+          this.scheduleFlush()
+          return
+        }
+        // reset() 必须真的清空：跳过合并，否则盘上旧数据会被并回来。
+        if (!this.skipMerge) await this.mergeFromDisk()
+        this.skipMerge = false
+        const payload = {
+          version: FILE_VERSION,
+          updatedAt: this.updatedAt,
+          records: Object.fromEntries(this.records),
+        }
+        const temporary = `${this.file}.tmp`
         await mkdir(dirname(this.file), { recursive: true })
-        await writeFile(temporary, text, 'utf8')
+        await writeFile(temporary, JSON.stringify(payload), 'utf8')
         await rename(temporary, this.file)
       } catch (error) {
         this.dirty = true
         this.logger?.warn(`llm-usage: 写入数据文件失败：${String(error?.message ?? error)}`)
+      } finally {
+        if (locked) await this.releaseLock()
       }
     })
     return this.flushChain
+  }
+
+  /**
+   * 拿 `usage.lock` 独占锁（短临界区，写完就释放）。
+   * 进程被硬杀会留下锁文件，靠 pid 存活探测 + 60 秒心跳超时判定为残留并清掉。
+   * @param {number} [waitMs]
+   */
+  async acquireLock(waitMs = 3000) {
+    const deadline = Date.now() + Math.max(0, waitMs)
+    for (;;) {
+      try {
+        const handle = await open(this.lockFile, 'wx')
+        await handle.writeFile(JSON.stringify({ pid: process.pid, at: Date.now() }), 'utf8')
+        await handle.close()
+        return true
+      } catch (error) {
+        if (error?.code !== 'EEXIST') return false
+        if (await this.lockIsStale()) {
+          await unlink(this.lockFile).catch(() => {})
+          continue
+        }
+        if (Date.now() >= deadline) {
+          if (!this.lockWarned) {
+            this.lockWarned = true
+            this.logger?.warn?.('llm-usage: 另一个实例正持有数据文件锁，本次暂不写盘，稍后重试')
+          }
+          return false
+        }
+        await sleep(80)
+      }
+    }
+  }
+
+  /** 锁是否已经失效（属主进程已退出 / 超过 60 秒没动静 / 本进程自己的残留）。 */
+  async lockIsStale() {
+    try {
+      const raw = JSON.parse(await readFile(this.lockFile, 'utf8'))
+      const pid = Number(raw?.pid)
+      const at = Number(raw?.at) || 0
+      if (!pid || pid === process.pid) return true
+      if (Date.now() - at > 60_000) return true
+      try {
+        process.kill(pid, 0)
+        return false
+      } catch {
+        return true
+      }
+    } catch {
+      return true
+    }
+  }
+
+  async releaseLock() {
+    await unlink(this.lockFile).catch(() => {})
+  }
+
+  /** 把盘上其它实例写过的桶并进内存（逐字段取大）。 */
+  async mergeFromDisk() {
+    let parsed
+    try {
+      parsed = JSON.parse(await readFile(this.file, 'utf8'))
+    } catch {
+      return
+    }
+    const rawRecords = parsed?.records && typeof parsed.records === 'object' ? parsed.records : {}
+    for (const [key, raw] of Object.entries(rawRecords)) {
+      const incoming = reviveRecord(key, raw)
+      const current = this.records.get(key)
+      if (!current) {
+        this.records.set(key, incoming)
+        continue
+      }
+      mergeMaxInto(current, incoming)
+      this.recount(current)
+    }
+    this.updatedAt = Math.max(this.updatedAt, Number(parsed?.updatedAt) || 0)
   }
 
   async close() {
@@ -406,6 +539,7 @@ export class UsageStore {
   }
 
   async reset() {
+    this.skipMerge = true
     this.records.clear()
     this.updatedAt = Date.now()
     this.dirty = true
@@ -450,7 +584,7 @@ export class UsageStore {
   summary({ days = 7 } = {}) {
     const names = this.platformNames()
     const now = Date.now()
-    const from = days > 0 ? dayKeyBefore(days - 1, now) : ''
+    const from = days > 0 ? dayKeyBefore(days - 1, now, this.utcOffsetHours) : ''
     const groups = new Map()
 
     const ensureGroup = (provider) => {
@@ -557,7 +691,7 @@ export class UsageStore {
     const providerId = String(provider || '')
     const modelId = String(model || '')
     const windowDays = Math.max(0, Number(days) || 0)
-    const from = windowDays > 0 ? dayKeyBefore(windowDays - 1, Date.now()) : ''
+    const from = windowDays > 0 ? dayKeyBefore(windowDays - 1, Date.now(), this.utcOffsetHours) : ''
     const totals = emptyTotals()
     const hours = []
     const record = this.records.get(`${providerId}/${modelId}`)

@@ -50,9 +50,31 @@ export const DEFAULT_PRICING = Object.freeze({
   'deepseek-account/*': { input: 2, output: 8, cacheRead: 0.04, cacheWrite: 0 },
 })
 
-/** 北京时间（UTC+8）的「小时 / 星期 / 日期」，用于匹配峰谷时段。 */
-export function beijingParts(timestamp) {
-  const shifted = new Date(Number(timestamp) + 8 * 3600 * 1000)
+/**
+ * 把任何输入收敛成合法的时区偏移（-12 ~ +14）；非法值按默认的北京时间返回。
+ * @param {unknown} value
+ * @param {number} [fallback]
+ */
+export function normalizeOffsetHours(value, fallback = 8) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return fallback
+  return Math.max(-12, Math.min(14, Math.round(n * 4) / 4))
+}
+
+/** 时区偏移转成 ISO 后缀（+08:00），用来拼「某天某小时」的时间戳。 */
+export function offsetZone(utcOffsetHours = 8) {
+  const offset = normalizeOffsetHours(utcOffsetHours)
+  const sign = offset < 0 ? '-' : '+'
+  const abs = Math.abs(offset)
+  const hours = String(Math.floor(abs)).padStart(2, '0')
+  const minutes = String(Math.round((abs - Math.floor(abs)) * 60)).padStart(2, '0')
+  return `${sign}${hours}:${minutes}`
+}
+
+/** 「小时 / 星期 / 日期」按给定时区偏移切分，用于匹配峰谷时段。 */
+export function beijingParts(timestamp, utcOffsetHours = 8) {
+  const offset = normalizeOffsetHours(utcOffsetHours)
+  const shifted = new Date(Number(timestamp) + offset * 3600 * 1000)
   const year = shifted.getUTCFullYear()
   const month = String(shifted.getUTCMonth() + 1).padStart(2, '0')
   const day = String(shifted.getUTCDate()).padStart(2, '0')
@@ -99,13 +121,13 @@ export function normalizeUsage(usage) {
 }
 
 /** 把毫秒时间戳格式化为北京时间 YYYY-MM-DD。 */
-export function dayKey(timestamp = Date.now()) {
-  return beijingParts(timestamp).dayKey
+export function dayKey(timestamp = Date.now(), utcOffsetHours = 8) {
+  return beijingParts(timestamp, utcOffsetHours).dayKey
 }
 
 /** 从某个时间点往前 days 天，返回北京时间 YYYY-MM-DD。 */
-export function dayKeyBefore(days, timestamp = Date.now()) {
-  return dayKey(Number(timestamp) - Math.max(0, days) * 24 * 3600 * 1000)
+export function dayKeyBefore(days, timestamp = Date.now(), utcOffsetHours = 8) {
+  return dayKey(Number(timestamp) - Math.max(0, days) * 24 * 3600 * 1000, utcOffsetHours)
 }
 
 /** 规则是否含峰谷时段/阶梯（用于判断能否按聚合数据重算历史）。 */
@@ -119,9 +141,9 @@ export function isComplexRule(rule) {
  * @param {number} at 毫秒时间戳
  * @param {number} [promptTokens] 输入 token 数（阶梯价用）
  */
-export function rateAt(rule, at, promptTokens = 0) {
+export function rateAt(rule, at, promptTokens = 0, utcOffsetHours = 8) {
   if (!rule || rule.source === SOURCE_NONE) return { rate: ZERO_RATE, label: '', peak: false }
-  const { hour, weekday, dayKey: day } = beijingParts(at)
+  const { hour, weekday, dayKey: day } = beijingParts(at, utcOffsetHours)
   const holiday = Array.isArray(rule.holidays) && rule.holidays.includes(day)
 
   // 阶梯价：按输入 token 选档；选完档即视为全天统一价。
@@ -168,7 +190,7 @@ export function rateAt(rule, at, promptTokens = 0) {
  * @param {string[]} [options.holidays] 视为空闲时段的日期（YYYY-MM-DD，北京时间）
  * @param {number} [options.usdToCny] 美元价折算成人民币的汇率（通用页面抓到 $ 价时用）
  */
-export function createPricer({ custom = {}, providers = {}, holidays = [], usdToCny = 7.1 } = {}) {
+export function createPricer({ custom = {}, providers = {}, holidays = [], usdToCny = 7.1, utcOffsetHours = 8 } = {}) {
   const customTable = custom && typeof custom === 'object' ? custom : {}
   const tables = providers && typeof providers === 'object' ? providers : {}
 
@@ -259,7 +281,7 @@ export function createPricer({ custom = {}, providers = {}, holidays = [], usdTo
   /** 某次调用（时间 + 输入长度）的单价与峰谷标签。 */
   function priceFor(provider, model, at, promptTokens = 0) {
     const rule = resolve(provider, model)
-    const picked = rateAt(rule, at, promptTokens)
+    const picked = rateAt(rule, at, promptTokens, utcOffsetHours)
     return { rule, ...picked }
   }
 
