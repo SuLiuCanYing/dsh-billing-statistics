@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "LLM Usage Insights",
+    "description": "Counts model API calls, tokens, and computed spend per platform and model; prices sync from provider pricing pages, including peak/off-peak windows and tiers."
+  }
+}

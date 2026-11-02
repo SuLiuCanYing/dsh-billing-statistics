@@ -1,0 +1,11 @@
+# llm-usage-insights bundle: 采集模型调用计量并在侧栏提供一个统计页。
+- insert:
+    - id: llm-usage
+      name: 'llm-usage-insights'
+      config:
+        retainDays: 30
+        showCost: true
+        # 官网价格：每天自动同步一次（当天没开程序则下次启动补抓）；
+        # 平台没填官网链接时自动搜索填，页面里每个平台后面也能手改。
+        priceSync: true
+        autoDiscover: true

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="LLM usage insights">
+  <defs>
+    <linearGradient id="llmu-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2a6df4"/>
+      <stop offset="1" stop-color="#7b3ff2"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#llmu-bg)"/>
+  <g fill="#ffffff">
+    <rect x="14" y="36" width="7" height="14" rx="2" opacity="0.85"/>
+    <rect x="25" y="26" width="7" height="24" rx="2" opacity="0.92"/>
+    <rect x="36" y="18" width="7" height="32" rx="2"/>
+    <rect x="47" y="30" width="5" height="20" rx="2" opacity="0.78"/>
+  </g>
+  <path d="M12 54h40" stroke="#ffffff" stroke-width="2.4" stroke-linecap="round" opacity="0.55"/>
+</svg>
