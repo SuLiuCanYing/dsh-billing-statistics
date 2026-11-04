@@ -22,7 +22,7 @@ Per-provider, per-model usage and billing accounting for DeepSeek Harness: calls
 `dsh-billing-statistics` is a local ledger for DSH model calls: it records calls passing through `llm/stream` by provider, model, and hour, estimates spend from a price table, and adds reports plus official-bill comparison. It does not proxy model requests or log in to provider platforms.
 
 - **Limited scope**: only calls passing through DSH `llm/stream` are counted. Direct API calls, other clients, and traffic while DSH is not running are absent.
-- **Estimates, not bills**: spend is derived from models.dev, the official DeepSeek price table, or manual prices. The official bill remains authoritative. Reconciliation needs you to enter the official amount, calls, and tokens by hand; the plugin does not scrape bills or store credentials.
+- **Estimates, not bills**: spend is derived from models.dev, the official DeepSeek price table, or manual prices. The official bill remains authoritative. Reconciliation needs you to enter the official amount by hand; calls and tokens are optional. The plugin does not scrape bills or store credentials.
 - **No budget enforcement**: there are no daily/monthly budgets, request blocking, balance queries, or top-ups. It only records and displays.
 - **Price sources are labelled**: catalog prices are references, not contract rates; unmatched models fall back to built-in or manual prices, and the UI shows the source.
 - **Local data only**: stored under `$DSH_HOME/llm-usage-insights/`; no cloud sync or multi-machine merge. Uninstalling does not delete the ledger; remove that directory yourself to wipe it.
