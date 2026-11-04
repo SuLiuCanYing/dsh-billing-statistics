@@ -48,4 +48,5 @@ If the maintainer judges this a duplicate, closing or narrowing the entry is fin
 
 - MIT licensed.
 - `icon` points at a 180×180 PNG in the repository, not the package's SVG.
+- `tarball` points at a version-free `.tgz` asset on the latest GitHub release, so the link stays valid across releases.
 - The repository also carries `submission/` with this entry and PR body; it is excluded from the npm package by `files`.
