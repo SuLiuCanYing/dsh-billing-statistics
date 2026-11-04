@@ -1,11 +1,37 @@
 {
-  "name": "llm-usage-insights",
-  "version": "1.4.0",
-  "private": true,
+  "name": "dsh-billing-statistics",
+  "version": "1.13.0",
+  "private": false,
   "license": "MIT",
-  "description": "按平台与模型统计模型 API 的调用次数、token 与花费（价格从平台官网同步，含峰谷价），并在侧栏提供入口页面。",
+  "author": "SuLiuCanYing",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SuLiuCanYing/dsh-billing-statistics.git"
+  },
+  "homepage": "https://github.com/SuLiuCanYing/dsh-billing-statistics#readme",
+  "bugs": {
+    "url": "https://github.com/SuLiuCanYing/dsh-billing-statistics/issues"
+  },
+  "description": "模型 API 计费统计：按平台/模型汇总调用、token 与估算花费；models.dev 价格、DeepSeek 官方峰谷价、人工价格、HTML/PDF 报表与官方账单对齐。数据仅存本机。",
   "type": "module",
   "icon": "icon.svg",
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "llm",
+    "usage",
+    "token",
+    "cost",
+    "billing",
+    "statistics",
+    "pdf"
+  ],
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.1-rc.5 <0.3.0"
+  },
   "scripts": {
     "test": "node --test \"test/*.test.js\""
   },
@@ -17,14 +43,20 @@
   },
   "files": [
     "index.js",
+    "schema.js",
     "client.js",
     "pricing.js",
-    "price-source.js",
+    "deepseek-official.js",
+    "model-catalog.js",
+    "catalog-snapshot.json",
     "usage-store.js",
     "export-csv.js",
+    "export-report.js",
+    "export-pdf.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
+    "PLUGIN-DECLARATION.md",
     "README.md",
     "README.en.md",
     "LICENSE",
@@ -40,11 +72,17 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/schemastery": "~3.18.5"
+    "@deepseek-ai/schemastery": ">=3.18.5"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/schemastery": {
       "optional": true
     }
+  },
+  "dependencies": {
+    "pdfkit": "0.20.2"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

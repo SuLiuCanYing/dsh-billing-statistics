@@ -12,6 +12,7 @@ import {
   offsetZone,
   rateAt,
   SOURCE_CUSTOM,
+  SOURCE_CATALOG,
   SOURCE_ESTIMATE,
   SOURCE_NONE,
   SOURCE_OFFICIAL,
@@ -119,12 +120,26 @@ test('computeCost：按百万 token 折算，缺字段按 0', () => {
   assert.equal(computeCost(null, PEAK), 0)
 })
 
-test('normalizeUsage / normalizeRate：负数与非法值一律归零', () => {
-  const usage = normalizeUsage({ inputTokens: -5, outputTokens: '120', cacheReadTokens: 10, reasoningTokens: 3 })
-  assert.equal(usage.inputTokens, 0)
-  assert.equal(usage.outputTokens, 120)
-  assert.equal(usage.totalTokens, 120)
-  assert.deepEqual(normalizeRate({ input: -1, output: 'x', cacheRead: 0.5 }), { input: 0, output: 0, cacheRead: 0.5, cacheWrite: 0 })
+test('normalizeUsage：兼容 snake_case / Anthropic 缓存字段，规范字段优先', () => {
+  const snake = normalizeUsage({
+    input_tokens: 100,
+    output_tokens: 20,
+    cache_read_input_tokens: 5,
+    cache_creation_input_tokens: 7,
+    reasoning_tokens: 3,
+    total_tokens: 140,
+  })
+  assert.deepEqual(snake, {
+    inputTokens: 100,
+    outputTokens: 20,
+    totalTokens: 140,
+    cacheReadTokens: 5,
+    cacheWriteTokens: 7,
+    reasoningTokens: 3,
+  })
+  const canonical = normalizeUsage({ inputTokens: 9, input_tokens: 99, outputTokens: 2 })
+  assert.equal(canonical.inputTokens, 9)
+  assert.equal(canonical.totalTokens, 11)
 })
 
 test('时区偏移：beijingParts / dayKey / rateAt 都按传入偏移切分', () => {
@@ -153,5 +168,30 @@ test('时区偏移：beijingParts / dayKey / rateAt 都按传入偏移切分', (
   assert.equal(rateAt(rule, tenUtc, 0, 0).label, '峰')
   assert.equal(rateAt(rule, tenUtc, 0, 8).label, '谷')
   assert.equal(rateAt(rule, tenUtc, 0, 8).rate.input, 4)
+})
+
+test('createPricer：models.dev 美元目录价按汇率折算并标成 catalog', () => {
+  const pricer = createPricer({
+    usdToCny: 7.1,
+    providers: {
+      siliconflow2: {
+        currency: 'USD',
+        source: 'catalog',
+        models: {
+          'deepseek-ai/DeepSeek-V4.1-Flash': {
+            currency: 'USD',
+            origin: 'catalog',
+            periods: [{ label: 'models.dev · Modal', ranges: [[0, 24]], rate: { input: 0.3, output: 1.2, cacheRead: 0.03, cacheWrite: 0 } }],
+            tiers: [],
+          },
+        },
+      },
+    },
+  })
+  const rule = pricer.resolve('siliconflow2', 'deepseek-ai/DeepSeek-V4.1-Flash')
+  assert.equal(rule.source, SOURCE_CATALOG)
+  assert.equal(rule.periods[0].rate.input, 2.13)
+  assert.equal(rule.periods[0].rate.output, 8.52)
+  assert.equal(rule.periods[0].rate.cacheRead, 0.213)
 })
 

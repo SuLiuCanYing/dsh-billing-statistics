@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "LLM Usage Insights",
-    "description": "Counts model API calls, tokens, and computed spend per platform and model; prices sync from provider pricing pages, including peak/off-peak windows and tiers."
+    "title": "LLM Billing Statistics",
+    "description": "Counts model API calls, tokens, and estimated spend per platform and model, with models.dev prices, DeepSeek peak/off-peak rates, manual prices, HTML/PDF reports, and official-bill reconciliation. Data stays local."
   }
 }

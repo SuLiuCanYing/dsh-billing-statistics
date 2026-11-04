@@ -6,12 +6,12 @@
  * `hours[YYYY-MM-DD][HH] = { calls, failed, aborted, tokens, cost, peakCost }`，
  * 面板再按天汇总。这样价格同步后可以按每个小时的时段单价重算历史花费。
  *
- * 数据文件：`$DSH_HOME/llm-usage-insights/usage.json`（原子写）。
+ * 数据文件：`$DSH_HOME/llm-usage-insights/usage.json`（历史兼容目录，原子写）。
  * 内存为准、文件为投影：每次调用改内存，短延迟防抖后整体落盘；
  * 写失败只记录日志，不阻塞模型调用。
  */
 
-import { mkdir, open, readFile, rename, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import {
   beijingParts,
@@ -52,6 +52,8 @@ function emptyRecord(provider, model) {
     ...emptyTotals(),
     price: { source: SOURCE_NONE, currency: 'CNY' },
     hours: {},
+    // 月度汇总不随小时桶裁剪，用来支撑「年 / 全部」的长期统计。
+    months: {},
   }
 }
 
@@ -82,7 +84,35 @@ function emptyBucket() {
   return { calls: 0, failed: 0, aborted: 0, tokens: emptyTokens(), cost: 0, peakCost: 0 }
 }
 
-/** 合并另一份记录的小时桶：逐字段取大（两实例互相覆盖时宁可少算，也不重复计数）。 */
+/**
+ * 金额统一保留 6 位小数（0.000001 元）。
+ * 计量本身用完整精度算，落账时收敛到 6 位，避免浮点尾数（0.1+0.2 那种）影响对账；
+ * 报表（HTML / CSV）同样按 6 位输出，这是账本可追溯的最高精度。
+ */
+function roundMoney(value) {
+  const n = Number(value)
+  return Number.isFinite(n) ? Math.round(n * 1000000) / 1000000 : 0
+}
+
+/** 合并一份桶集合（小时/月）到目标集合：逐字段取大，避免两实例互相覆盖时重复计数。 */
+function mergeBucketsInto(target, incoming, keyPattern) {
+  for (const [slot, bucket] of Object.entries(incoming ?? {})) {
+    if (!keyPattern.test(slot) || !bucket || typeof bucket !== 'object') continue
+    const current = (target[slot] = target[slot] ?? emptyBucket())
+    for (const key of ['calls', 'failed', 'aborted', 'cost', 'peakCost']) {
+      current[key] = Math.max(current[key] ?? 0, bucket[key] ?? 0)
+    }
+    current.cost = roundMoney(current.cost)
+    current.peakCost = roundMoney(current.peakCost)
+    for (const key of ['input', 'output', 'cacheRead', 'cacheWrite', 'reasoning', 'total']) {
+      current.tokens[key] = Math.max(current.tokens[key] ?? 0, bucket.tokens?.[key] ?? 0)
+    }
+    current.tokens.prompt = current.tokens.input + current.tokens.cacheRead + current.tokens.cacheWrite
+    current.tokens.total = current.tokens.prompt + current.tokens.output
+  }
+}
+
+/** 合并另一份记录的小时桶与月桶：逐字段取大（两实例互相覆盖时宁可少算，也不重复计数）。 */
 function mergeMaxInto(target, incoming) {
   for (const [day, buckets] of Object.entries(incoming.hours ?? {})) {
     const mine = (target.hours[day] = target.hours[day] ?? {})
@@ -91,6 +121,8 @@ function mergeMaxInto(target, incoming) {
       for (const key of ['calls', 'failed', 'aborted', 'cost', 'peakCost']) {
         current[key] = Math.max(current[key] ?? 0, bucket[key] ?? 0)
       }
+      current.cost = roundMoney(current.cost)
+      current.peakCost = roundMoney(current.peakCost)
       for (const key of ['input', 'output', 'cacheRead', 'cacheWrite', 'reasoning', 'total']) {
         current.tokens[key] = Math.max(current.tokens[key] ?? 0, bucket.tokens?.[key] ?? 0)
       }
@@ -98,6 +130,8 @@ function mergeMaxInto(target, incoming) {
       current.tokens.total = current.tokens.prompt + current.tokens.output
     }
   }
+  target.months = target.months ?? {}
+  mergeBucketsInto(target.months, incoming.months, /^\d{4}-\d{2}$/)
   if (incoming.firstCall > 0) {
     target.firstCall = target.firstCall > 0 ? Math.min(target.firstCall, incoming.firstCall) : incoming.firstCall
   }
@@ -135,8 +169,8 @@ function reviveRecord(key, raw) {
   record.failed = Number(raw.failed) || 0
   record.aborted = Number(raw.aborted) || 0
   record.tokens = numbersOf(raw.tokens)
-  record.cost = Number.isFinite(Number(raw.cost)) ? Number(raw.cost) : 0
-  record.peakCost = Number.isFinite(Number(raw.peakCost)) ? Number(raw.peakCost) : 0
+  record.cost = roundMoney(raw.cost)
+  record.peakCost = roundMoney(raw.peakCost)
   record.firstCall = Number(raw.firstCall) || 0
   record.lastCall = Number(raw.lastCall) || 0
   const price = raw.price && typeof raw.price === 'object' ? raw.price : {}
@@ -156,8 +190,8 @@ function reviveRecord(key, raw) {
         bucket.failed = Number(entry.failed) || 0
         bucket.aborted = Number(entry.aborted) || 0
         bucket.tokens = numbersOf(entry.tokens)
-        bucket.cost = Number.isFinite(Number(entry.cost)) ? Number(entry.cost) : 0
-        bucket.peakCost = Number.isFinite(Number(entry.peakCost)) ? Number(entry.peakCost) : bucket.cost
+        bucket.cost = roundMoney(entry.cost)
+        bucket.peakCost = Number.isFinite(Number(entry.peakCost)) ? roundMoney(entry.peakCost) : bucket.cost
         record.hours[day] = record.hours[day] ?? {}
         record.hours[day][hour] = bucket
       }
@@ -173,9 +207,34 @@ function reviveRecord(key, raw) {
       bucket.failed = Number(entry.failed) || 0
       bucket.aborted = Number(entry.aborted) || 0
       bucket.tokens = numbersOf(entry.tokens)
-      bucket.cost = Number.isFinite(Number(entry.cost)) ? Number(entry.cost) : 0
+      bucket.cost = roundMoney(entry.cost)
       bucket.peakCost = bucket.cost
       record.hours[day] = { '12': bucket }
+    }
+  }
+
+  // 月汇总：长期保留（不随小时桶裁剪），用于「年 / 全部」视图。
+  if (raw.months && typeof raw.months === 'object') {
+    for (const [month, entry] of Object.entries(raw.months)) {
+      if (!/^\d{4}-\d{2}$/.test(month) || !entry || typeof entry !== 'object') continue
+      const bucket = emptyBucket()
+      bucket.calls = Number(entry.calls) || 0
+      bucket.failed = Number(entry.failed) || 0
+      bucket.aborted = Number(entry.aborted) || 0
+      bucket.tokens = numbersOf(entry.tokens)
+      bucket.cost = roundMoney(entry.cost)
+      bucket.peakCost = Number.isFinite(Number(entry.peakCost)) ? roundMoney(entry.peakCost) : bucket.cost
+      record.months[month] = bucket
+    }
+  }
+  // 旧文件只有小时桶：用它补出月汇总，升级后即可按年查看。
+  if (Object.keys(record.months).length === 0) {
+    for (const [day, buckets] of Object.entries(record.hours)) {
+      const month = day.slice(0, 7)
+      const target = (record.months[month] = record.months[month] ?? emptyBucket())
+      for (const bucket of Object.values(buckets)) addInto(target, bucket)
+      target.cost = roundMoney(target.cost)
+      target.peakCost = roundMoney(target.peakCost)
     }
   }
 
@@ -211,6 +270,19 @@ export class UsageStore {
     this.flushTimer = null
     this.flushChain = Promise.resolve()
     this.closed = false
+    this.loadPromise = null
+    this.readOnly = false
+    this.lastFlushOk = true
+  }
+
+  /** load() 只会执行一次；流钩子记账前可以先等这个 Promise。 */
+  load() {
+    if (!this.loadPromise) this.loadPromise = this.loadOnce()
+    return this.loadPromise
+  }
+
+  whenReady() {
+    return this.loadPromise ?? Promise.resolve()
   }
 
   /** 价格表更新后换计价器并重算历史（含阶梯价的模型保持原值）。 */
@@ -219,7 +291,25 @@ export class UsageStore {
     return this.reprice()
   }
 
-  async load() {
+  /**
+   * 历史文件损坏时先改名备份，再按空数据启动；绝不直接把它覆盖成空文件。
+   * 如果连改名都失败，则进入只读模式，宁可本次不落盘也不销毁证据。
+   */
+  async quarantineBrokenFile(error) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const backup = `${this.file}.corrupt-${stamp}`
+    try {
+      await rename(this.file, backup)
+      this.logger?.warn?.(`llm-usage: 历史数据损坏，已备份到 ${backup}，本次按空数据启动：${String(error?.message ?? error)}`)
+    } catch (renameError) {
+      this.readOnly = true
+      this.logger?.error?.(
+        `llm-usage: 历史数据损坏且无法备份，已暂停写入以免覆盖原文件；请检查 ${this.file}：${String(renameError?.message ?? renameError)}`,
+      )
+    }
+  }
+
+  async loadOnce() {
     try {
       const text = await readFile(this.file, 'utf8')
       const parsed = JSON.parse(text)
@@ -237,9 +327,7 @@ export class UsageStore {
         this.logger?.info?.(`llm-usage: 数据文件从 v${version} 迁移到 v${FILE_VERSION}（按小时分桶）`)
       }
     } catch (error) {
-      if (error?.code !== 'ENOENT') {
-        this.logger?.warn(`llm-usage: 读取历史数据失败，按空数据启动：${String(error?.message ?? error)}`)
-      }
+      if (error?.code !== 'ENOENT') await this.quarantineBrokenFile(error)
     }
     this.loadedAt = Date.now()
     this.prune()
@@ -250,7 +338,7 @@ export class UsageStore {
     }
   }
 
-  /** 删掉超出保留期的小时桶，并重算总计，避免总量随裁剪漂移。 */
+  /** 删掉超出保留期的小时桶（月汇总永久保留），再按月汇总重算总计。 */
   prune() {
     const cutoff = dayKeyBefore(this.retainDays - 1, Date.now(), this.utcOffsetHours)
     let removed = 0
@@ -261,14 +349,6 @@ export class UsageStore {
           removed += 1
         }
       }
-      if (Object.keys(record.hours).length === 0) {
-        record.calls = 0
-        record.failed = 0
-        record.aborted = 0
-        record.tokens = emptyTokens()
-        record.cost = 0
-        record.peakCost = 0
-      }
     }
     if (removed > 0) {
       for (const record of this.records.values()) this.recount(record)
@@ -277,28 +357,33 @@ export class UsageStore {
     }
   }
 
-  /** 用小时桶重算一条记录的总计（calls/tokens/cost/首末调用时间）。 */
+  /** 用月汇总重算一条记录的总计（calls/tokens/cost/首末调用时间）；旧数据没有月桶时退回小时桶。 */
   recount(record) {
     const totals = emptyTotals()
     totals.firstCall = record.firstCall
     totals.lastCall = record.lastCall
-    for (const [day, buckets] of Object.entries(record.hours)) {
-      for (const [hour, bucket] of Object.entries(buckets)) {
-        addInto(totals, bucket)
-        const zone = offsetZone(this.utcOffsetHours)
-        if (totals.firstCall === 0 && bucket.calls > 0) {
-          totals.firstCall = Date.parse(`${day}T${hour}:00:00${zone}`) || totals.firstCall
+    const monthly = Object.values(record.months ?? {})
+    if (monthly.length > 0) {
+      for (const bucket of monthly) addInto(totals, bucket)
+    } else {
+      for (const [day, buckets] of Object.entries(record.hours)) {
+        for (const [hour, bucket] of Object.entries(buckets)) {
+          addInto(totals, bucket)
+          const zone = offsetZone(this.utcOffsetHours)
+          if (totals.firstCall === 0 && bucket.calls > 0) {
+            totals.firstCall = Date.parse(`${day}T${hour}:00:00${zone}`) || totals.firstCall
+          }
+          const at = Date.parse(`${day}T${hour}:59:59${zone}`)
+          if (Number.isFinite(at) && at > totals.lastCall) totals.lastCall = at
         }
-        const at = Date.parse(`${day}T${hour}:59:59${zone}`)
-        if (Number.isFinite(at) && at > totals.lastCall) totals.lastCall = at
       }
     }
     record.calls = totals.calls
     record.failed = totals.failed
     record.aborted = totals.aborted
     record.tokens = totals.tokens
-    record.cost = totals.cost
-    record.peakCost = totals.peakCost
+    record.cost = roundMoney(totals.cost)
+    record.peakCost = roundMoney(totals.peakCost)
   }
 
   /**
@@ -326,12 +411,13 @@ export class UsageStore {
     const rate = priced?.rate ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
     const source = priced?.rule?.source ?? SOURCE_NONE
     const currency = priced?.rule?.currency ?? 'CNY'
-    const cost =
+    const cost = roundMoney(
       (tokens.inputTokens * rate.input +
         tokens.outputTokens * rate.output +
         tokens.cacheReadTokens * rate.cacheRead +
         tokens.cacheWriteTokens * rate.cacheWrite) /
-      1_000_000
+        1_000_000,
+    )
     const delta = {
       calls: 1,
       failed: outcome === 'failed' ? 1 : 0,
@@ -351,12 +437,24 @@ export class UsageStore {
     record.lastCall = at
     record.price = { source, currency }
     addInto(record, delta)
+    record.cost = roundMoney(record.cost)
+    record.peakCost = roundMoney(record.peakCost)
 
     const day = dayKey(at, this.utcOffsetHours)
     const hour = String(beijingParts(at, this.utcOffsetHours).hour).padStart(2, '0')
     const buckets = (record.hours[day] = record.hours[day] ?? {})
     const bucket = (buckets[hour] = buckets[hour] ?? emptyBucket())
     addInto(bucket, delta)
+    bucket.cost = roundMoney(bucket.cost)
+    bucket.peakCost = roundMoney(bucket.peakCost)
+
+    // 月汇总：与小时桶同一份 delta，长期保留。
+    const month = day.slice(0, 7)
+    record.months = record.months ?? {}
+    const monthly = (record.months[month] = record.months[month] ?? emptyBucket())
+    addInto(monthly, delta)
+    monthly.cost = roundMoney(monthly.cost)
+    monthly.peakCost = roundMoney(monthly.peakCost)
 
     this.updatedAt = at
     this.dirty = true
@@ -364,11 +462,15 @@ export class UsageStore {
   }
 
   /** 价格表变化后，按当前规则重算所有小时桶的花费（阶梯价模型跳过，保留原值）。 */
-  reprice() {
+  reprice(keys = null) {
     if (!this.pricer) return
     let changed = 0
-    for (const record of this.records.values()) {
+    const trusted = (this.priceTrusted = this.priceTrusted ?? new Set())
+    for (const [key, record] of this.records) {
+      if (keys && !keys.has(key)) continue
       const rule = this.pricer.resolve(record.provider, record.model)
+      // 没价可依的模型保持原值，避免重算时按 0 元把历史花费清掉。
+      if (rule.source === SOURCE_NONE) continue
       if (isComplexRule(rule) && (rule.tiers?.length ?? 0) > 0) continue
       let touched = 0
       for (const [day, buckets] of Object.entries(record.hours)) {
@@ -378,20 +480,30 @@ export class UsageStore {
           if (!Number.isFinite(at)) continue
           const promptTokens = bucket.tokens.input + bucket.tokens.cacheRead + bucket.tokens.cacheWrite
           const picked = rateAt(rule, at, promptTokens, this.utcOffsetHours)
-          const cost =
+          const cost = roundMoney(
             (bucket.tokens.input * picked.rate.input +
               bucket.tokens.output * picked.rate.output +
               bucket.tokens.cacheRead * picked.rate.cacheRead +
               bucket.tokens.cacheWrite * picked.rate.cacheWrite) /
-            1_000_000
+              1_000_000,
+          )
+          const nextPeak = picked.peak ? cost : 0
+          // 月汇总同步调整增量，保证「年 / 全部」和历史小时桶一致；
+          // 已被裁剪、只剩月汇总的月份不受影响。
+          const monthly = record.months?.[day.slice(0, 7)]
+          if (monthly) {
+            monthly.cost = roundMoney(monthly.cost + (cost - bucket.cost))
+            monthly.peakCost = roundMoney(monthly.peakCost + (nextPeak - (bucket.peakCost ?? 0)))
+          }
           bucket.cost = cost
-          bucket.peakCost = picked.peak ? cost : 0
+          bucket.peakCost = nextPeak
           touched += 1
         }
       }
       if (touched > 0) {
         this.recount(record)
         record.price = { source: rule.source, currency: rule.currency ?? 'CNY' }
+        trusted.add(key)
         changed += 1
       }
     }
@@ -417,8 +529,19 @@ export class UsageStore {
     if (this.closed) return this.flushChain
     this.flushChain = this.flushChain.then(async () => {
       if (!this.dirty) return
+      if (this.readOnly) {
+        this.dirty = true
+        this.lastFlushOk = false
+        if (!this.readOnlyWarned) {
+          this.readOnlyWarned = true
+          this.logger?.warn?.('llm-usage: 数据文件损坏且未能备份，已暂停写盘；修复/移走原文件后重启插件即可恢复')
+        }
+        return
+      }
       this.dirty = false
       let locked = false
+      let temporary = ''
+      this.lastFlushOk = false
       try {
         locked = await this.acquireLock()
         if (!locked) {
@@ -430,19 +553,26 @@ export class UsageStore {
         // reset() 必须真的清空：跳过合并，否则盘上旧数据会被并回来。
         if (!this.skipMerge) await this.mergeFromDisk()
         this.skipMerge = false
+        // 重算过价格的记录：合并盘上数据后要按合并后的 token 再算一次，
+        // 否则盘上的旧价（取大合并）会把刚降下来的花费顶回去。
+        if (this.priceTrusted?.size) this.reprice(new Set(this.priceTrusted))
         const payload = {
           version: FILE_VERSION,
           updatedAt: this.updatedAt,
           records: Object.fromEntries(this.records),
         }
-        const temporary = `${this.file}.tmp`
+        temporary = `${this.file}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 10)}`
         await mkdir(dirname(this.file), { recursive: true })
         await writeFile(temporary, JSON.stringify(payload), 'utf8')
         await rename(temporary, this.file)
+        temporary = ''
+        this.lastFlushOk = true
+        this.priceTrusted?.clear()
       } catch (error) {
         this.dirty = true
         this.logger?.warn(`llm-usage: 写入数据文件失败：${String(error?.message ?? error)}`)
       } finally {
+        if (temporary) await unlink(temporary).catch(() => {})
         if (locked) await this.releaseLock()
       }
     })
@@ -458,9 +588,11 @@ export class UsageStore {
     const deadline = Date.now() + Math.max(0, waitMs)
     for (;;) {
       try {
-        const handle = await open(this.lockFile, 'wx')
-        await handle.writeFile(JSON.stringify({ pid: process.pid, at: Date.now() }), 'utf8')
-        await handle.close()
+        // 用带 wx 的单次写创建锁：比 open + write 少一个“文件已存在但内容为空”的窗口。
+        await writeFile(this.lockFile, JSON.stringify({ pid: process.pid, at: Date.now() }), {
+          encoding: 'utf8',
+          flag: 'wx',
+        })
         return true
       } catch (error) {
         if (error?.code !== 'EEXIST') return false
@@ -480,20 +612,32 @@ export class UsageStore {
     }
   }
 
-  /** 锁是否已经失效（属主进程已退出 / 超过 60 秒没动静 / 本进程自己的残留）。 */
+  /**
+   * 锁是否已经失效（属主进程已退出 / 超过 60 秒没动静 / 空锁但已超过创建宽限）。
+   * 空/半截锁在刚创建的两秒内视为“正在写”，避免两个进程同时看到空文件后互删锁。
+   */
   async lockIsStale() {
+    let info
     try {
-      const raw = JSON.parse(await readFile(this.lockFile, 'utf8'))
-      const pid = Number(raw?.pid)
-      const at = Number(raw?.at) || 0
-      if (!pid || pid === process.pid) return true
-      if (Date.now() - at > 60_000) return true
-      try {
-        process.kill(pid, 0)
-        return false
-      } catch {
-        return true
-      }
+      info = await stat(this.lockFile)
+    } catch (error) {
+      return error?.code === 'ENOENT' ? true : false
+    }
+    let raw
+    try {
+      raw = JSON.parse(await readFile(this.lockFile, 'utf8'))
+    } catch {
+      return Date.now() - Number(info.mtimeMs || 0) > 2000
+    }
+    const pid = Number(raw?.pid)
+    const at = Number(raw?.at) || 0
+    if (!pid) return Date.now() - Number(info.mtimeMs || 0) > 2000
+    // 同一个进程里的另一个 store 也是活锁，不能因为 pid 相同就删掉。
+    if (pid === process.pid) return false
+    if (Date.now() - at > 60_000) return true
+    try {
+      process.kill(pid, 0)
+      return false
     } catch {
       return true
     }
@@ -508,8 +652,12 @@ export class UsageStore {
     let parsed
     try {
       parsed = JSON.parse(await readFile(this.file, 'utf8'))
-    } catch {
-      return
+    } catch (error) {
+      if (error?.code === 'ENOENT') return
+      // 盘上文件在运行中被改坏：暂停写入，别用内存覆盖掉最后的证据。
+      this.readOnly = true
+      this.logger?.warn?.(`llm-usage: 盘上数据文件损坏，已暂停写入以免覆盖：${String(error?.message ?? error)}`)
+      throw error
     }
     const rawRecords = parsed?.records && typeof parsed.records === 'object' ? parsed.records : {}
     for (const [key, raw] of Object.entries(rawRecords)) {
@@ -539,11 +687,22 @@ export class UsageStore {
   }
 
   async reset() {
+    const previousRecords = new Map(this.records)
+    const previousUpdatedAt = this.updatedAt
     this.skipMerge = true
     this.records.clear()
     this.updatedAt = Date.now()
     this.dirty = true
+    this.lastFlushOk = false
     await this.flush()
+    if (!this.lastFlushOk) {
+      // 清空没有真正落盘时恢复内存，避免页面显示“已清空”而磁盘仍是旧数据。
+      this.records = previousRecords
+      this.updatedAt = previousUpdatedAt
+      this.dirty = false
+      this.skipMerge = false
+      throw new Error('无法写入数据文件，重置未生效')
+    }
   }
 
   /** 平台展示名：优先取 llm 目录里的 displayName，其次用 provider id。 */
@@ -562,7 +721,85 @@ export class UsageStore {
     return names
   }
 
-  /** 已用过的 provider → 出现过的模型 id 列表（官网通用解析时用来定位模型名）。 */
+  /**
+   * 某一天按平台汇总，供「官方账单对齐」窗口使用。
+   * 只读小时桶，不改变任何统计口径；没有记录的日期返回空的 providers。
+   * @param {string} day YYYY-MM-DD
+   */
+  dayTotals(day) {
+    const key = String(day ?? '')
+    const names = this.platformNames()
+    const groups = new Map()
+
+    const ensureGroup = (provider) => {
+      let group = groups.get(provider)
+      if (!group) {
+        group = {
+          provider,
+          displayName: names[provider] ?? provider,
+          calls: 0,
+          failed: 0,
+          aborted: 0,
+          tokens: emptyTokens(),
+          cost: 0,
+          peakCost: 0,
+          models: 0,
+        }
+        groups.set(provider, group)
+      }
+      return group
+    }
+
+    for (const record of this.records.values()) {
+      const buckets = record.hours?.[key]
+      if (!buckets) continue
+      const totals = emptyTotals()
+      for (const bucket of Object.values(buckets)) addInto(totals, bucket)
+      if (totals.calls === 0 && totals.tokens.total === 0) continue
+      const group = ensureGroup(record.provider)
+      group.calls += totals.calls
+      group.failed += totals.failed
+      group.aborted += totals.aborted
+      for (const name of Object.keys(group.tokens)) group.tokens[name] += totals.tokens[name]
+      group.cost += totals.cost
+      group.peakCost += totals.peakCost
+      group.models += 1
+    }
+
+    const providers = [...groups.values()]
+      .map((group) => ({
+        ...group,
+        cost: roundMoney(group.cost),
+        peakCost: roundMoney(group.peakCost),
+      }))
+      .sort((a, b) => b.calls - a.calls || a.provider.localeCompare(b.provider))
+    const overall = {
+      calls: providers.reduce((sum, entry) => sum + entry.calls, 0),
+      failed: providers.reduce((sum, entry) => sum + entry.failed, 0),
+      aborted: providers.reduce((sum, entry) => sum + entry.aborted, 0),
+      tokens: emptyTokens(),
+      cost: 0,
+      peakCost: 0,
+      platforms: providers.length,
+    }
+    for (const entry of providers) {
+      for (const name of Object.keys(overall.tokens)) overall.tokens[name] += entry.tokens[name]
+      overall.cost += entry.cost
+      overall.peakCost += entry.peakCost
+    }
+    overall.cost = roundMoney(overall.cost)
+    overall.peakCost = roundMoney(overall.peakCost)
+
+    return {
+      day: key,
+      generatedAt: Date.now(),
+      utcOffsetHours: this.utcOffsetHours,
+      providers,
+      totals: overall,
+    }
+  }
+
+  /** 已用过的 provider → 出现过的模型 id 列表（models.dev 检索与人工导入表格使用）。 */
   providerModels() {
     const table = {}
     for (const record of this.records.values()) {
@@ -579,12 +816,15 @@ export class UsageStore {
 
   /**
    * 构造面板 payload。
-   * @param {{ days?: number }} [options]
+   * @param {{ days?: number, year?: number }} [options]
+   * days>0：按天视图（小时桶）；year>0：该年按月视图；days=0 且无 year：全部按年视图。
    */
-  summary({ days = 7 } = {}) {
+  summary({ days = 7, year = 0 } = {}) {
     const names = this.platformNames()
     const now = Date.now()
-    const from = days > 0 ? dayKeyBefore(days - 1, now, this.utcOffsetHours) : ''
+    const yearNum = Math.max(0, Math.floor(Number(year) || 0))
+    const allTime = yearNum === 0 && !(Number(days) > 0)
+    const from = !yearNum && Number(days) > 0 ? dayKeyBefore(days - 1, now, this.utcOffsetHours) : ''
     const groups = new Map()
 
     const ensureGroup = (provider) => {
@@ -601,31 +841,94 @@ export class UsageStore {
       return group
     }
 
+    const rowOf = (totals, extra) => ({
+      ...extra,
+      calls: totals.calls,
+      failed: totals.failed,
+      aborted: totals.aborted,
+      tokens: { ...totals.tokens },
+      cost: roundMoney(totals.cost),
+      peakCost: roundMoney(totals.peakCost),
+    })
+
+    /** 全站年份列表：只依赖月汇总，供顶部年份切换使用。 */
+    const yearTotals = new Map()
+    for (const record of this.records.values()) {
+      for (const [month, bucket] of Object.entries(record.months ?? {})) {
+        const y = month.slice(0, 4)
+        const totals = yearTotals.get(y) ?? emptyTotals()
+        addInto(totals, bucket)
+        yearTotals.set(y, totals)
+      }
+    }
+    const years = [...yearTotals.entries()]
+      .map(([y, totals]) => rowOf(totals, { year: y }))
+      .sort((a, b) => (a.year < b.year ? 1 : a.year > b.year ? -1 : 0))
+
+    /** 选中某年时，全站按月汇总（页面据此直接列出 12 个月）。 */
+    const monthTotals = new Map()
+    if (yearNum > 0) {
+      const prefix = `${yearNum}-`
+      for (const record of this.records.values()) {
+        for (const [month, bucket] of Object.entries(record.months ?? {})) {
+          if (!month.startsWith(prefix)) continue
+          const totals = monthTotals.get(month) ?? emptyTotals()
+          addInto(totals, bucket)
+          monthTotals.set(month, totals)
+        }
+      }
+    }
+    const months = [...monthTotals.entries()]
+      .map(([month, totals]) => rowOf(totals, { month }))
+      .sort((a, b) => (a.month < b.month ? -1 : a.month > b.month ? 1 : 0))
+
     for (const record of this.records.values()) {
       const group = ensureGroup(record.provider)
       const totals = emptyTotals()
-      const daily = []
-      let daysWithData = 0
-      for (const [day, buckets] of Object.entries(record.hours)) {
-        if (from !== '' && day < from) continue
-        const dayTotals = emptyTotals()
-        for (const bucket of Object.values(buckets)) addInto(dayTotals, bucket)
-        if (dayTotals.calls === 0 && dayTotals.tokens.total === 0) continue
-        addInto(totals, dayTotals)
-        daily.push({
-          day,
-          calls: dayTotals.calls,
-          failed: dayTotals.failed,
-          aborted: dayTotals.aborted,
-          tokens: { ...dayTotals.tokens },
-          cost: dayTotals.cost,
-          peakCost: dayTotals.peakCost,
-        })
-        daysWithData += 1
+      let rows = []
+      let kind = 'day'
+
+      if (yearNum > 0) {
+        kind = 'month'
+        const prefix = `${yearNum}-`
+        for (const [month, bucket] of Object.entries(record.months ?? {})) {
+          if (!month.startsWith(prefix)) continue
+          const monthly = emptyTotals()
+          addInto(monthly, bucket)
+          addInto(totals, monthly)
+          rows.push(rowOf(monthly, { month }))
+        }
+      } else if (allTime) {
+        kind = 'year'
+        const byYear = new Map()
+        for (const [month, bucket] of Object.entries(record.months ?? {})) {
+          const y = month.slice(0, 4)
+          const monthly = byYear.get(y) ?? emptyTotals()
+          addInto(monthly, bucket)
+          byYear.set(y, monthly)
+        }
+        rows = [...byYear.entries()]
+          .map(([y, monthly]) => {
+            addInto(totals, monthly)
+            return rowOf(monthly, { year: y })
+          })
+          .sort((a, b) => (a.year < b.year ? 1 : a.year > b.year ? -1 : 0))
+      } else {
+        for (const [day, buckets] of Object.entries(record.hours)) {
+          if (from !== '' && day < from) continue
+          const dayTotals = emptyTotals()
+          for (const bucket of Object.values(buckets)) addInto(dayTotals, bucket)
+          if (dayTotals.calls === 0 && dayTotals.tokens.total === 0) continue
+          addInto(totals, dayTotals)
+          rows.push(rowOf(dayTotals, { day }))
+        }
+        rows.sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0))
       }
-      if (daysWithData === 0) continue
-      daily.sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0))
+
+      if (rows.length === 0) continue
       addInto(group.totals, totals)
+      group.totals.cost = roundMoney(group.totals.cost)
+      group.totals.peakCost = roundMoney(group.totals.peakCost)
       const price = this.pricer?.describe(record.provider, record.model) ?? {
         source: SOURCE_NONE,
         currency: 'CNY',
@@ -639,13 +942,15 @@ export class UsageStore {
         failed: totals.failed,
         aborted: totals.aborted,
         tokens: { ...totals.tokens },
-        cost: totals.cost,
-        peakCost: totals.peakCost,
+        cost: roundMoney(totals.cost),
+        peakCost: roundMoney(totals.peakCost),
         costKnown: price.source !== SOURCE_NONE,
         price,
         firstCall: record.firstCall,
         lastCall: record.lastCall,
-        daily,
+        daily: kind === 'day' ? rows : [],
+        months: kind === 'month' ? rows : [],
+        years: kind === 'year' ? rows : [],
       })
     }
 
@@ -659,14 +964,21 @@ export class UsageStore {
 
     const overall = emptyTotals()
     for (const group of platforms) addInto(overall, group.totals)
+    overall.cost = roundMoney(overall.cost)
+    overall.peakCost = roundMoney(overall.peakCost)
 
     return {
       generatedAt: now,
       updatedAt: this.updatedAt || this.loadedAt,
-      days,
-      from: from || null,
+      kind: yearNum > 0 ? 'month' : allTime ? 'year' : 'day',
+      days: yearNum > 0 ? 0 : days,
+      year: yearNum || null,
+      from: yearNum > 0 ? `${yearNum}-01-01` : from || null,
+      years,
+      months,
       showCost: this.showCost,
       retainDays: this.retainDays,
+      utcOffsetHours: this.utcOffsetHours,
       platforms,
       totals: {
         calls: overall.calls,
@@ -683,27 +995,50 @@ export class UsageStore {
   }
 
   /**
-   * 单个模型的按小时明细（供页面二次展开使用）。
-   * 只返回有调用的时段，按日期、小时升序。
-   * @param {{ provider?: string, model?: string, days?: number }} [options]
+   * 单个模型的明细（供页面二次展开使用）。
+   * - 默认/按天：小时桶，按日期、小时升序
+   * - year>0：该年各月
+   * - days=0 且无 year：各年
+   * @param {{ provider?: string, model?: string, days?: number, year?: number }} [options]
    */
-  modelDetail({ provider, model, days = 0 } = {}) {
+  modelDetail({ provider, model, days = 0, year = 0 } = {}) {
     const providerId = String(provider || '')
     const modelId = String(model || '')
+    const yearNum = Math.max(0, Math.floor(Number(year) || 0))
     const windowDays = Math.max(0, Number(days) || 0)
-    const from = windowDays > 0 ? dayKeyBefore(windowDays - 1, Date.now(), this.utcOffsetHours) : ''
+    const allTime = yearNum === 0 && windowDays === 0
+    const grain = yearNum > 0 ? 'month' : allTime ? 'year' : 'hour'
+    const from = grain === 'hour' && windowDays > 0 ? dayKeyBefore(windowDays - 1, Date.now(), this.utcOffsetHours) : ''
     const totals = emptyTotals()
     const hours = []
     const record = this.records.get(`${providerId}/${modelId}`)
     if (record) {
-      for (const [day, buckets] of Object.entries(record.hours)) {
-        if (from !== '' && day < from) continue
-        for (const [hour, bucket] of Object.entries(buckets)) {
-          if (!bucket || (bucket.calls === 0 && bucket.tokens?.total === 0)) continue
+      if (grain === 'hour') {
+        for (const [day, buckets] of Object.entries(record.hours)) {
+          if (from !== '' && day < from) continue
+          for (const [hour, bucket] of Object.entries(buckets)) {
+            if (!bucket || (bucket.calls === 0 && bucket.tokens?.total === 0)) continue
+            addInto(totals, bucket)
+            hours.push({
+              day,
+              hour: Number(hour),
+              calls: bucket.calls,
+              failed: bucket.failed,
+              aborted: bucket.aborted,
+              tokens: { ...bucket.tokens },
+              cost: bucket.cost,
+              peakCost: bucket.peakCost,
+            })
+          }
+        }
+        hours.sort((a, b) => (a.day === b.day ? a.hour - b.hour : a.day < b.day ? -1 : 1))
+      } else if (grain === 'month') {
+        const prefix = `${yearNum}-`
+        for (const [month, bucket] of Object.entries(record.months ?? {})) {
+          if (!month.startsWith(prefix) || !bucket) continue
           addInto(totals, bucket)
           hours.push({
-            day,
-            hour: Number(hour),
+            month,
             calls: bucket.calls,
             failed: bucket.failed,
             aborted: bucket.aborted,
@@ -712,13 +1047,39 @@ export class UsageStore {
             peakCost: bucket.peakCost,
           })
         }
+        hours.sort((a, b) => (a.month < b.month ? -1 : a.month > b.month ? 1 : 0))
+      } else {
+        const byYear = new Map()
+        for (const [month, bucket] of Object.entries(record.months ?? {})) {
+          if (!bucket) continue
+          const y = month.slice(0, 4)
+          const yearly = byYear.get(y) ?? emptyTotals()
+          addInto(yearly, bucket)
+          byYear.set(y, yearly)
+        }
+        for (const [y, yearly] of byYear) {
+          addInto(totals, yearly)
+          hours.push({
+            year: y,
+            calls: yearly.calls,
+            failed: yearly.failed,
+            aborted: yearly.aborted,
+            tokens: { ...yearly.tokens },
+            cost: roundMoney(yearly.cost),
+            peakCost: roundMoney(yearly.peakCost),
+          })
+        }
+        hours.sort((a, b) => (a.year < b.year ? -1 : a.year > b.year ? 1 : 0))
       }
-      hours.sort((a, b) => (a.day === b.day ? a.hour - b.hour : a.day < b.day ? -1 : 1))
     }
+    totals.cost = roundMoney(totals.cost)
+    totals.peakCost = roundMoney(totals.peakCost)
     return {
       provider: providerId,
       model: modelId,
+      grain,
       windowDays,
+      year: yearNum || null,
       from: from || null,
       hours,
       totals,

@@ -1,20 +1,137 @@
 /**
  * 价格解析与计价。
  *
- * 三层来源，优先级从高到低：
+ * 来源，优先级从高到低：
  * 1. 插件配置里的 `pricing`（用户手填，覆盖一切）；
- * 2. 官网同步的价格表（price-source.js 抓取，含峰谷时段 / 阶梯价）；
- * 3. 内置参考价（估算，官网抓不到时兜底）。
+ * 2. 人工导入价格（manual）；
+ * 3. DeepSeek 官方 API 自动价（official，仅官方 provider）；
+ * 4. models.dev 目录价格（catalog，含跨平台参考价）；
+ * 5. 内置参考价（估算，目录没匹配时兜底）。
  *
- * 价格单位统一为「元 / 百万 token」；`currency` 目前均为 CNY。
+ * 价格单位统一为「元 / 百万 token」；models.dev 的美元价在计价器里按汇率折算。
  */
 
 export const SOURCE_CUSTOM = 'custom'
 export const SOURCE_OFFICIAL = 'official'
+export const SOURCE_CATALOG = 'catalog'
+export const SOURCE_MANUAL = 'manual'
 export const SOURCE_ESTIMATE = 'estimate'
 export const SOURCE_NONE = 'none'
 
 export const ZERO_RATE = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 })
+
+function hasRate(rate) {
+  return Boolean(rate && (rate.input || rate.output || rate.cacheRead || rate.cacheWrite))
+}
+
+function padHour(hour) {
+  return `${String(hour).padStart(2, '0')}:00`
+}
+
+/** 峰时时段显示成「09:00-12:00、14:00-18:00」。 */
+export function formatPeakRanges(ranges) {
+  return (ranges ?? []).map(([from, to]) => `${padHour(from)}-${padHour(to)}`).join('、')
+}
+
+/** 峰时适用日期的中文说明；null / 七天都算每天。 */
+export function peakDaysLabel(days) {
+  if (!Array.isArray(days) || days.length === 0 || days.length === 7) return '每天'
+  const set = new Set(days)
+  if (set.size === 5 && [1, 2, 3, 4, 5].every((day) => set.has(day))) return '工作日'
+  if (set.size === 2 && set.has(0) && set.has(6)) return '周末'
+  const names = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+  return days.map((day) => names[day] ?? `周${day}`).join('、')
+}
+
+/**
+ * 校验人工导入的峰时设置：
+ * `{ ranges: [[9,12],[14,18]], days: [1,2,3,4,5] }`。
+ * 时段按整点，结束可写 24；ranges 为空表示不启用峰时。
+ */
+export function normalizeManualPeak(value) {
+  if (value == null) return null
+  if (typeof value !== 'object' || Array.isArray(value)) throw new Error('峰时设置格式不对')
+  const rawRanges = Array.isArray(value.ranges) ? value.ranges : []
+  const ranges = []
+  const seen = new Set()
+  for (const item of rawRanges) {
+    const pair = Array.isArray(item) ? item : [item?.from, item?.to]
+    const from = Number(pair[0])
+    const to = Number(pair[1])
+    if (!Number.isInteger(from) || !Number.isInteger(to) || from < 0 || to > 24 || from >= to) {
+      throw new Error('峰时时段格式不对：按整点填写，例如 09:00-12:00')
+    }
+    const key = `${from}-${to}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    ranges.push([from, to])
+  }
+  if (ranges.length === 0) return null
+  ranges.sort((a, b) => a[0] - b[0])
+  let days = null
+  if (Array.isArray(value.days) && value.days.length > 0) {
+    const unique = [...new Set(value.days.map((day) => Number(day)))]
+    if (unique.some((day) => !Number.isInteger(day) || day < 0 || day > 6)) {
+      throw new Error('峰时适用日期格式不对')
+    }
+    unique.sort((a, b) => a - b)
+    if (unique.length < 7) days = unique
+  }
+  return {
+    ranges,
+    days,
+    label: `${formatPeakRanges(ranges)}（${peakDaysLabel(days)}）`,
+  }
+}
+
+/** 用基础价 + 可选峰时价生成一条人工价格记录；峰时价全 0 表示全天统一价。 */
+function manualPriceEntry(id, base, high, currency, plan) {
+  const baseRate = normalizeRate(base)
+  const peakRate = normalizeRate(high)
+  if (!hasRate(baseRate) && !hasRate(peakRate)) throw new Error(`模型 ${id} 没有有效价格`)
+  if (hasRate(peakRate) && !hasRate(baseRate)) throw new Error(`模型 ${id} 有峰时价但基础价为 0`)
+  if (hasRate(peakRate) && !plan) throw new Error(`模型 ${id} 填了峰时价，但没有设置峰时时段`)
+  const periods = []
+  if (hasRate(peakRate) && plan) {
+    periods.push({
+      label: `峰时 ${plan.label}`,
+      ranges: plan.ranges,
+      ...(plan.days ? { days: plan.days } : {}),
+      rate: peakRate,
+    })
+  }
+  periods.push({
+    label: hasRate(peakRate) ? '谷时/其他时段' : '人工导入价格',
+    ranges: [[0, 24]],
+    rate: baseRate,
+  })
+  return {
+    currency,
+    origin: 'manual',
+    free: false,
+    periods,
+    tiers: [],
+  }
+}
+
+/** 从旧人工价里取出基础价（全天时段优先）。 */
+function baseRateOf(entry) {
+  const periods = Array.isArray(entry?.periods) ? entry.periods : []
+  const full = periods.find((period) => (period.ranges ?? []).some(([from, to]) => from === 0 && to === 24))
+  return full?.rate ?? entry?.defaultRate ?? periods[periods.length - 1]?.rate ?? {}
+}
+
+/** 从旧人工价里取出峰时价。 */
+function peakRateOf(entry) {
+  const periods = Array.isArray(entry?.periods) ? entry.periods : []
+  const peak = periods.find(
+    (period) =>
+      String(period.label ?? '').startsWith('峰时') ||
+      (period.ranges ?? []).some(([from, to]) => !(from === 0 && to === 24)),
+  )
+  return peak?.rate ?? {}
+}
+
 
 /** 规范化一条价格记录。 */
 export function normalizeRate(value) {
@@ -32,9 +149,58 @@ export function normalizeRate(value) {
 }
 
 /**
+ * 把人工导入的简化价格表转成 prices.json 的 provider.models 结构。
+ * 输入形如 `{ "model-id": { input, output, cacheRead, cacheWrite, peakInput, ... } }`；
+ * 也可以带 `{ rate: {...}, peak: {...} }`。峰时价可省略。
+ * `peak` 是 `{ ranges, days }`，见 normalizeManualPeak。
+ */
+export function normalizeManualPriceModels(input, { currency = 'CNY', peak = null } = {}) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('价格表必须是「模型 ID → 单价」的对象')
+  const curr = currency === 'USD' ? 'USD' : 'CNY'
+  const plan = normalizeManualPeak(peak)
+  const models = {}
+  for (const [rawId, rawValue] of Object.entries(input)) {
+    const id = String(rawId ?? '').trim()
+    if (!id || id.length > 200) throw new Error('模型 ID 为空或过长')
+    const raw = rawValue?.rate ?? rawValue ?? {}
+    const base = normalizeRate(raw)
+    const high = normalizeRate(
+      rawValue?.peak ?? {
+        input: raw.peakInput ?? rawValue?.peakInput,
+        output: raw.peakOutput ?? rawValue?.peakOutput,
+        cacheRead: raw.peakCacheRead ?? rawValue?.peakCacheRead,
+        cacheWrite: raw.peakCacheWrite ?? rawValue?.peakCacheWrite,
+      },
+    )
+    models[id] = manualPriceEntry(id, base, high, curr, plan)
+  }
+  if (Object.keys(models).length === 0) throw new Error('没有可导入的模型价格')
+  return models
+}
+
+/** 人工导入只覆盖本次填写的模型，未填写的旧人工价保留。 */
+export function mergeManualPriceModels(previous, normalized) {
+  return { ...(previous ?? {}), ...(normalized ?? {}) }
+}
+
+/** 峰时时段改了以后，把旧人工价的峰时 / 基础价搬到新时段上。 */
+export function retimeManualPriceModels(models, peak = null) {
+  const plan = normalizeManualPeak(peak)
+  const result = {}
+  for (const [id, entry] of Object.entries(models ?? {})) {
+    try {
+      result[id] = manualPriceEntry(id, baseRateOf(entry), plan ? peakRateOf(entry) : {}, entry?.currency ?? 'CNY', plan)
+    } catch {
+      result[id] = entry
+    }
+  }
+  return result
+}
+
+/**
  * 内置参考价（元 / 百万 token，估算）。
- * 2026-11 官网价：硅基流动 DeepSeek-V4.1-Flash 峰时 2/8/0.04、谷时 1/4/0.02；
- * DeepSeek 官方 deepseek-flash 峰时 2/8/0.04、谷时 1/4/0.02。这里取峰时价，仅作抓不到官网时的兜底。
+ * 2026-11 公开价：硅基流动 DeepSeek-V4.1-Flash 峰时 2/8/0.04、谷时 1/4/0.02；
+ * DeepSeek 官方 deepseek-flash 峰时 2/8/0.04、谷时 1/4/0.02。这里取峰时价，仅作 models.dev 未匹配时的兜底。
  */
 export const DEFAULT_PRICING = Object.freeze({
   'siliconflow/deepseek-ai/DeepSeek-V4-Flash': { input: 3, output: 9, cacheRead: 0.3, cacheWrite: 0 },
@@ -47,7 +213,15 @@ export const DEFAULT_PRICING = Object.freeze({
   'siliconflow/moonshotai/Kimi-K2.7-Code': { input: 6.5, output: 27, cacheRead: 1.3, cacheWrite: 0 },
   'siliconflow2/*': { input: 2, output: 8, cacheRead: 0.04, cacheWrite: 0 },
   'deepseek-official/*': { input: 2, output: 8, cacheRead: 0.04, cacheWrite: 0 },
-  'deepseek-account/*': { input: 2, output: 8, cacheRead: 0.04, cacheWrite: 0 },
+  // DeepSeek 官方账号 deepseek-flash：峰时 2/8/0.04、谷时 1/4/0.02 元/百万 token。
+  // 峰时范围按公开价口径 UTC 01-04、06-10 = 北京时间 09-12、14-18，仅工作日；其余全算谷时。
+  'deepseek-account/*': {
+    currency: 'CNY',
+    periods: [
+      { label: '峰时 09-12/14-18（工作日）', ranges: [[9, 12], [14, 18]], days: [1, 2, 3, 4, 5], rate: { input: 2, output: 8, cacheRead: 0.04, cacheWrite: 0 } },
+      { label: '谷时', ranges: [[0, 24]], rate: { input: 1, output: 4, cacheRead: 0.02, cacheWrite: 0 } },
+    ],
+  },
 })
 
 /**
@@ -103,20 +277,23 @@ export function computeCost(usage, rate) {
 /** 把 TokenUsage 归一化为零缺失的对象。 */
 export function normalizeUsage(usage) {
   const source = usage && typeof usage === 'object' ? usage : {}
-  const n = (key) => {
-    const value = Number(source[key])
-    return Number.isFinite(value) && value > 0 ? value : 0
+  const pick = (...keys) => {
+    for (const key of keys) {
+      const value = Number(source[key])
+      if (Number.isFinite(value) && value > 0) return value
+    }
+    return 0
   }
-  const inputTokens = n('inputTokens')
-  const outputTokens = n('outputTokens')
-  const totalTokens = Number(source.totalTokens)
+  const inputTokens = pick('inputTokens', 'input_tokens')
+  const outputTokens = pick('outputTokens', 'output_tokens')
+  const totalTokens = pick('totalTokens', 'total_tokens')
   return {
     inputTokens,
     outputTokens,
-    totalTokens: Number.isFinite(totalTokens) && totalTokens > 0 ? totalTokens : inputTokens + outputTokens,
-    cacheReadTokens: n('cacheReadTokens'),
-    cacheWriteTokens: n('cacheWriteTokens'),
-    reasoningTokens: n('reasoningTokens'),
+    totalTokens: totalTokens > 0 ? totalTokens : inputTokens + outputTokens,
+    cacheReadTokens: pick('cacheReadTokens', 'cache_read_tokens', 'cache_read_input_tokens'),
+    cacheWriteTokens: pick('cacheWriteTokens', 'cache_write_tokens', 'cache_creation_input_tokens'),
+    reasoningTokens: pick('reasoningTokens', 'reasoning_tokens'),
   }
 }
 
@@ -143,7 +320,10 @@ export function isComplexRule(rule) {
  */
 export function rateAt(rule, at, promptTokens = 0, utcOffsetHours = 8) {
   if (!rule || rule.source === SOURCE_NONE) return { rate: ZERO_RATE, label: '', peak: false }
-  const { hour, weekday, dayKey: day } = beijingParts(at, utcOffsetHours)
+  // 官方价表可以声明自己的时区（DeepSeek 官方峰时按 UTC 定义）；
+  // 其它规则继续跟随插件的 utcOffsetHours。
+  const effectiveOffset = normalizeOffsetHours(rule.utcOffsetHours ?? utcOffsetHours)
+  const { hour, weekday, dayKey: day } = beijingParts(at, effectiveOffset)
   const holiday = Array.isArray(rule.holidays) && rule.holidays.includes(day)
 
   // 阶梯价：按输入 token 选档；选完档即视为全天统一价。
@@ -228,13 +408,21 @@ export function createPricer({ custom = {}, providers = {}, holidays = [], usdTo
     const table = tables[provider]
     if (!table?.models) return null
     const name = table.aliases?.[model] ?? model
-    const entry = table.models[name]
+    // 人工导入可能正好补在别名上；精确 ID 优先于目录别名，避免被覆盖。
+    const entry = table.models[model] ?? table.models[name]
     if (!entry) return null
     const currency = entry.currency ?? table.currency ?? 'CNY'
+    const source =
+      entry.origin === 'manual' || table.source === SOURCE_MANUAL
+        ? SOURCE_MANUAL
+        : entry.origin === SOURCE_CATALOG || table.source === SOURCE_CATALOG
+          ? SOURCE_CATALOG
+          : SOURCE_OFFICIAL
     return {
-      source: SOURCE_OFFICIAL,
+      source,
       currency: 'CNY',
       originalCurrency: currency,
+      utcOffsetHours: entry.utcOffsetHours ?? table.utcOffsetHours,
       periods: (entry.periods ?? []).map((period) => ({ ...period, rate: toCny(period.rate, currency) })),
       defaultRate: entry.defaultRate ? toCny(entry.defaultRate, currency) : undefined,
       defaultLabel: entry.defaultLabel || (entry.defaultRate ? '空闲时段' : ''),
@@ -249,7 +437,25 @@ export function createPricer({ custom = {}, providers = {}, holidays = [], usdTo
   const fromEstimate = (provider, model) => {
     for (const key of [`${provider}/${model}`, provider, `${provider}/*`, '*']) {
       if (!Object.prototype.hasOwnProperty.call(DEFAULT_PRICING, key)) continue
-      const rate = normalizeRate(DEFAULT_PRICING[key])
+      const value = DEFAULT_PRICING[key]
+      // 内置表同样允许带峰谷时段（官方账号按 UTC 区分峰谷），否则按单档价处理。
+      if (value && Array.isArray(value.periods)) {
+        return {
+          source: SOURCE_ESTIMATE,
+          currency: value.currency ?? 'CNY',
+          utcOffsetHours: value.utcOffsetHours,
+          periods: value.periods.map((period) => ({
+            label: period.label || '',
+            ranges: period.ranges ?? [],
+            days: period.days,
+            rate: normalizeRate(period.rate),
+          })),
+          tiers: [],
+          feedId: '',
+          holidays,
+        }
+      }
+      const rate = normalizeRate(value)
       if (rate.input || rate.output || rate.cacheRead || rate.cacheWrite) {
         return {
           source: SOURCE_ESTIMATE,
@@ -292,6 +498,7 @@ export function createPricer({ custom = {}, providers = {}, holidays = [], usdTo
       source: rule.source,
       currency: rule.currency,
       originalCurrency: rule.originalCurrency ?? rule.currency,
+      utcOffsetHours: rule.utcOffsetHours,
       url: rule.url ?? '',
       feedId: rule.feedId ?? '',
       periods: (rule.periods ?? []).map((period) => ({

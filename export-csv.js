@@ -33,13 +33,23 @@ function cell(value) {
 function money(value, known) {
   if (!known) return ''
   const n = Number(value)
-  return Number.isFinite(n) ? n.toFixed(6).replace(/0+$/, '').replace(/\.$/, '') : ''
+  if (!Number.isFinite(n)) return ''
+  // 账本金额统一到 6 位小数；这是导出能拿到的最高精度。
+  return n.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')
+}
+
+/** 汇总行金额：先四舍五入到 6 位，避免浮点累加出现 0.30000000000000004。 */
+function sumMoney(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return '0'
+  return (Math.round(n * 1000000) / 1000000).toFixed(6).replace(/0+$/, '').replace(/\.$/, '')
 }
 
 /**
  * 生成 CSV 文本（不含 BOM）。
+ * 兼容旧导出入口；不再向文件尾追加井号元数据，避免影响观感。
  * @param {object} summary UsageStore#summary() 的返回值
- * @param {{ generatedAt?: number }} [options]
+ * @param {{ generatedAt?: number }} [options] 兼容旧调用，当前不写入 CSV
  */
 export function buildCsv(summary, { generatedAt = 0 } = {}) {
   const lines = []
@@ -49,34 +59,41 @@ export function buildCsv(summary, { generatedAt = 0 } = {}) {
   for (const platform of summary?.platforms ?? []) {
     for (const model of platform.models ?? []) {
       const known = model.costKnown !== false && model.price?.source !== 'none'
-      for (const day of model.daily ?? []) {
+      // 按天 / 按月（年份视图）/ 按年（全部视图）共用同一套列，只是首列粒度不同。
+      const rows =
+        (model.daily && model.daily.length > 0 ? model.daily : null) ??
+        (model.months && model.months.length > 0 ? model.months : null) ??
+        model.years ??
+        []
+      for (const row of rows) {
+        const slot = row.day ?? row.month ?? row.year ?? ''
         lines.push(
           [
-            day.day,
+            slot,
             platform.provider,
             platform.displayName,
             model.model,
-            day.calls,
-            day.failed,
-            day.aborted,
-            day.tokens?.input ?? 0,
-            day.tokens?.cacheRead ?? 0,
-            day.tokens?.cacheWrite ?? 0,
-            day.tokens?.output ?? 0,
-            money(day.cost, known),
-            money(day.peakCost, known),
+            row.calls,
+            row.failed,
+            row.aborted,
+            row.tokens?.input ?? 0,
+            row.tokens?.cacheRead ?? 0,
+            row.tokens?.cacheWrite ?? 0,
+            row.tokens?.output ?? 0,
+            money(row.cost, known),
+            money(row.peakCost, known),
             model.price?.source ?? '',
           ].map(cell).join(','),
         )
-        totals.calls += Number(day.calls) || 0
-        totals.failed += Number(day.failed) || 0
-        totals.aborted += Number(day.aborted) || 0
-        totals.tokens.input += Number(day.tokens?.input) || 0
-        totals.tokens.cacheRead += Number(day.tokens?.cacheRead) || 0
-        totals.tokens.cacheWrite += Number(day.tokens?.cacheWrite) || 0
-        totals.tokens.output += Number(day.tokens?.output) || 0
-        totals.cost += Number(day.cost) || 0
-        totals.peakCost += Number(day.peakCost) || 0
+        totals.calls += Number(row.calls) || 0
+        totals.failed += Number(row.failed) || 0
+        totals.aborted += Number(row.aborted) || 0
+        totals.tokens.input += Number(row.tokens?.input) || 0
+        totals.tokens.cacheRead += Number(row.tokens?.cacheRead) || 0
+        totals.tokens.cacheWrite += Number(row.tokens?.cacheWrite) || 0
+        totals.tokens.output += Number(row.tokens?.output) || 0
+        totals.cost += Number(row.cost) || 0
+        totals.peakCost += Number(row.peakCost) || 0
       }
     }
   }
@@ -95,13 +112,12 @@ export function buildCsv(summary, { generatedAt = 0 } = {}) {
         totals.tokens.cacheRead,
         totals.tokens.cacheWrite,
         totals.tokens.output,
-        totals.cost.toFixed(6).replace(/0+$/, '').replace(/\.$/, ''),
-        totals.peakCost.toFixed(6).replace(/0+$/, '').replace(/\.$/, ''),
+        sumMoney(totals.cost),
+        sumMoney(totals.peakCost),
         '',
       ].map(cell).join(','),
     )
   }
 
-  if (generatedAt > 0) lines.push(`# generatedAt=${new Date(generatedAt).toISOString()}`)
   return lines.join('\r\n') + '\r\n'
 }

@@ -1,23 +1,41 @@
 /**
- * llm-usage-insights —— Host 半边。
+ * dsh-billing-statistics —— Host 半边。
  *
  * 采集：挂在 `llm/stream` 瀑布上包裹每一次模型请求尝试，从流里读 provider、
  *       model、usage 与 finish，写入按「平台 × 模型 × 小时」聚合的计数器。
- * 价格：每个平台一个官网价格页链接（页面可填，没填就自动搜索填入）；抓到的价格
- *       按平台缓存，含峰谷时段与阶梯价；抓不到时回退内置估算价，配置的 pricing 优先级最高。
- *       自动同步每天一次，错过的时间段在下次启动时补抓。
- * 持久化：`$DSH_HOME/llm-usage-insights/usage.json`、`prices.json`、`sources.json`（原子写）。
- * 接口：summary / reset / prices / prices/sync / sources（exact Web 路由，同一来源校验）。
+ * 价格：从 models.dev 的结构化模型目录里按平台 / 模型检索；目录带缓存在本地，
+ *       在线失败时用随插件发布的快照兜底；配置的 pricing / 人工导入价格优先级更高。
+ *       自动同步每天一次，错过的时间段在下次启动时刷新。
+ * 持久化：`$DSH_HOME/llm-usage-insights/usage.json`（历史兼容目录）、`prices.json`、`manual-prices.json`、`models-dev.json`（原子写）。
+ * 接口：summary / model / reset / prices / prices/official / prices/sync / prices/import / export.html / export.pdf（另保留 export.csv 兼容）。
  */
 
-import Schema from '@deepseek-ai/schemastery'
+import { loadSchema } from './schema.js'
 import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { UsageStore } from './usage-store.js'
-import { SOURCE_NONE, beijingParts, createPricer, normalizeOffsetHours } from './pricing.js'
+import { SOURCE_NONE, beijingParts, createPricer, mergeManualPriceModels, normalizeManualPeak, normalizeManualPriceModels, normalizeOffsetHours, normalizeUsage, retimeManualPriceModels } from './pricing.js'
 import { buildCsv } from './export-csv.js'
-import { discoverPriceUrl, fetchPricePage, knownFeedFor } from './price-source.js'
+import { buildReport } from './export-report.js'
+import { buildPdf } from './export-pdf.js'
+import {
+  OFFICIAL_PRICING_PAGE,
+  builtinOfficialPricing,
+  getOfficialPricing,
+  isDeepSeekOfficialProvider,
+  officialModelIds,
+  officialPlanForOffset,
+  officialPriceRows,
+  officialProviderModels,
+} from './deepseek-official.js'
+import {
+  CATALOG_SOURCE,
+  catalogPriceEntry,
+  loadCatalog,
+  lookupCatalogModel,
+  refreshCatalog,
+} from './model-catalog.js'
 
 /** 路由前缀；页面就按这个路径取数。 */
 export const API_PREFIX = '/api/llm-usage/v1'
@@ -25,66 +43,84 @@ const SUMMARY_PATH = `${API_PREFIX}/summary`
 const RESET_PATH = `${API_PREFIX}/reset`
 const PRICES_PATH = `${API_PREFIX}/prices`
 const PRICES_SYNC_PATH = `${API_PREFIX}/prices/sync`
-const SOURCES_PATH = `${API_PREFIX}/sources`
-const EXPORT_PATH = `${API_PREFIX}/export.csv`
+const PRICES_IMPORT_PATH = `${API_PREFIX}/prices/import`
+const PRICES_OFFICIAL_PATH = `${API_PREFIX}/prices/official`
+const EXPORT_REPORT_PATH = `${API_PREFIX}/export.html`
+const EXPORT_CSV_PATH = `${API_PREFIX}/export.csv`
+const EXPORT_PDF_PATH = `${API_PREFIX}/export.pdf`
 const MODEL_PATH = `${API_PREFIX}/model`
+const RECONCILE_PATH = `${API_PREFIX}/reconcile`
 
-const rateSchema = Schema.object({
-  input: Schema.number().min(0).default(0).description('输入（未命中缓存）元 / 百万 token。Input tokens (cache miss), CNY per 1M tokens.'),
-  output: Schema.number().min(0).default(0).description('输出元 / 百万 token。Output tokens, CNY per 1M tokens.'),
-  cacheRead: Schema.number().min(0).default(0).description('缓存命中读取 元 / 百万 token。Cache-hit reads, CNY per 1M tokens.'),
-  cacheWrite: Schema.number().min(0).default(0).description('缓存写入 元 / 百万 token。Cache writes, CNY per 1M tokens.'),
-})
+/** 对外注册的全部精确路由；单独导出便于测试防止“写了 handler 却忘了注册”。 */
+export const ROUTES = Object.freeze([
+  SUMMARY_PATH,
+  EXPORT_REPORT_PATH,
+  EXPORT_PDF_PATH,
+  EXPORT_CSV_PATH,
+  RESET_PATH,
+  MODEL_PATH,
+  RECONCILE_PATH,
+  PRICES_PATH,
+  PRICES_OFFICIAL_PATH,
+  PRICES_SYNC_PATH,
+  PRICES_IMPORT_PATH,
+])
 
-export const Config = Schema.object({
-  retainDays: Schema.number()
-    .min(1)
-    .max(3660)
-    .default(30)
-    .description('按天明细的保留天数（默认一个月）；更早的分桶在下次启动时清理。 Days of per-day detail kept; older buckets are pruned on next start.'),
-  showCost: Schema.boolean().default(true).description('页面上是否显示花费列与花费合计。 Whether the cost column and totals are shown in the panel.'),
-  priceSync: Schema.boolean()
-    .default(true)
-    .description('每天自动同步一次官网价格；当天时段没开程序的话，下次启动时补抓一次。 Sync official prices once a day; if the app was closed, catch up on next start.'),
-  autoDiscover: Schema.boolean()
-    .default(true)
-    .description('没填官网链接的平台，自动搜索价格页并填入（只采纳命中「价格/计费」页的结果，填错可手改）。 Auto-discover pricing pages for providers without a feed URL; only pricing-looking pages are accepted and the result stays editable.'),
-  priceFeeds: Schema.dict(Schema.string())
-    .default({})
-    .description(
-      'provider → 官网价格页链接的预设值；页面里每个平台后面的输入框会覆盖这里的值。 Preset provider → pricing-page URL; the per-provider input overrides it.' +
-        '留空表示靠自动搜索；写空字符串表示该平台不查官网、直接用内置规则。 Empty = auto-discovery; a blank string = built-in rules only.',
-    ),
-  usdToCny: Schema.number()
-    .min(0.1)
-    .max(100)
-    .default(7.1)
-    .description('通用页面解析到美元价（$）时，按这个汇率折成人民币计入花费。 Rate used to convert USD prices from generic pages into CNY.'),
-  peakHolidays: Schema.array(Schema.string())
-    .default([])
-    .description(
-      '视为「空闲时段」的日期（YYYY-MM-DD，北京时间），用于 DeepSeek 这类工作日峰谷价。 Dates (YYYY-MM-DD, UTC+8) treated as off-peak, e.g. Chinese public holidays. ' +
-        '中国法定节假日可填在这里，避免节假日按高峰价估算。',
-    ),
-  utcOffsetHours: Schema.number()
-    .min(-12)
-    .max(14)
-    .default(8)
-    .description(
-      '峰谷时段与「按天」分桶使用的时区偏移（小时），默认 8 即北京时间。 Timezone offset in hours used for peak windows and daily buckets; 8 = UTC+8 (Beijing). ' +
-        '填 0 表示 UTC，填 9 表示东京；数据文件里已有的分桶不会重排。 Existing buckets are not re-keyed when this changes.',
-    ),
-  pricing: Schema.dict(rateSchema)
-    .default({})
-    .description(
-      '每百万 token 的价格表，键可以是 provider、provider/model（模型 id 里的斜杠不影响匹配）或 *。 Price table per 1M tokens; keys may be provider, provider/model, or *. ' +
-        '写了同名键会整体覆盖官网/内置价格；全 0 视为未定价。 A matching key overrides official/built-in prices; all zeros mean unpriced.',
-    ),
-})
+const schemaLoad = await loadSchema()
+const Schema = schemaLoad.Schema
+
+function buildConfig(Schema) {
+  const rateSchema = Schema.object({
+    input: Schema.number().min(0).default(0).description('输入（未命中缓存）元 / 百万 token。Input tokens (cache miss), CNY per 1M tokens.'),
+    output: Schema.number().min(0).default(0).description('输出元 / 百万 token。Output tokens, CNY per 1M tokens.'),
+    cacheRead: Schema.number().min(0).default(0).description('缓存命中读取 元 / 百万 token。Cache-hit reads, CNY per 1M tokens.'),
+    cacheWrite: Schema.number().min(0).default(0).description('缓存写入 元 / 百万 token。Cache writes, CNY per 1M tokens.'),
+  })
+
+  return Schema.object({
+    retainDays: Schema.number()
+      .min(1)
+      .max(3660)
+      .default(30)
+      .description('按天明细的保留天数（默认一个月）；更早的分桶在下次启动时清理。 Days of per-day detail kept; older buckets are pruned on next start.'),
+    showCost: Schema.boolean().default(true).description('页面上是否显示花费列与花费合计。 Whether the cost column and totals are shown in the panel.'),
+    priceSync: Schema.boolean()
+      .default(true)
+      .description('每天自动刷新一次 models.dev 价格目录；当天没开程序的话，下次启动时补刷一次。 Refresh the models.dev catalog once a day; catch up on next start.'),
+    usdToCny: Schema.number()
+      .min(0.1)
+      .max(100)
+      .default(7.1)
+      .description('models.dev 与 DeepSeek 官方价都是美元 / 百万 token；按这个汇率折成人民币计入花费。 models.dev and DeepSeek official prices are USD per 1M tokens; this rate converts them to CNY.'),
+    peakHolidays: Schema.array(Schema.string())
+      .default([])
+      .description(
+        '视为「空闲时段」的日期（YYYY-MM-DD，按 utcOffsetHours 解释），用于 DeepSeek 这类工作日峰谷价。 Dates (YYYY-MM-DD, interpreted with utcOffsetHours) treated as off-peak, e.g. Chinese public holidays. ' +
+          '中国法定节假日可填在这里，避免节假日按高峰价估算。',
+      ),
+    utcOffsetHours: Schema.number()
+      .min(-12)
+      .max(14)
+      .default(8)
+      .description(
+        '峰谷时段与「按天」分桶使用的时区偏移（小时），默认 8 即北京时间。 Timezone offset in hours used for peak windows and daily buckets; 8 = UTC+8 (Beijing). ' +
+          '填 0 表示 UTC，填 9 表示东京；数据文件里已有的分桶不会重排。 Existing buckets are not re-keyed when this changes. ' +
+          'DeepSeek 官方价按 UTC 峰时计价，页面按这个偏移显示本地时段。',
+      ),
+    pricing: Schema.dict(rateSchema)
+      .default({})
+      .description(
+        '每百万 token 的价格表，键可以是 provider、provider/model（模型 id 里的斜杠不影响匹配）或 *。 Price table per 1M tokens; keys may be provider, provider/model, or *. ' +
+          '写了同名键会整体覆盖 models.dev / DeepSeek 官方 / 内置价格；全 0 视为未定价。 A matching key overrides models.dev/official/built-in prices; all zeros mean unpriced.',
+      ),
+  })
+}
+
+export const Config = Schema ? buildConfig(Schema) : undefined
 
 export const inject = ['llm', 'webServer']
 
-/** 数据目录：$DSH_HOME/llm-usage-insights。 */
+/** 数据目录：$DSH_HOME/llm-usage-insights（历史兼容路径，避免更名丢账）。 */
 function dataDirectory() {
   const home = process.env.DSH_HOME?.trim() || join(homedir(), '.dsh')
   return join(home, 'llm-usage-insights')
@@ -97,26 +133,55 @@ function providerDirectory(ctx) {
     if (!Array.isArray(entries)) return []
     return entries
       .map((entry) => {
+        // 目录项当前是对象；将来若退化成字符串，至少不要把平台整个丢掉。
+        if (typeof entry === 'string') {
+          const provider = entry.trim()
+          return provider ? { provider } : null
+        }
         if (!entry || typeof entry !== 'object') return null
         const provider = typeof entry.provider === 'string' ? entry.provider : ''
         if (!provider) return null
         return {
           provider,
           displayName: typeof entry.displayName === 'string' ? entry.displayName : undefined,
+          defaultBaseURL: typeof entry.defaultBaseURL === 'string' ? entry.defaultBaseURL : undefined,
+          baseURL: typeof entry.baseURL === 'string' ? entry.baseURL : undefined,
         }
       })
       .filter(Boolean)
   } catch (error) {
-    ctx.logger?.debug?.(`llm-usage: 读取 provider 目录失败：${String(error?.message ?? error)}`)
+    ctx.logger?.debug?.(`dsh-billing-statistics: 读取 provider 目录失败：${String(error?.message ?? error)}`)
     return []
   }
 }
 
 /** 流里的 usage 块归一化。字段缺失时按 0。 */
 function readUsage(chunk) {
-  const usage = chunk?.usage
-  if (!usage || typeof usage !== 'object') return null
+  // 当前契约是独立的 usage chunk；兼容将来把 usage 挂到 finish/任意 chunk 上的形态。
+  const usage = chunk?.usage ?? chunk?.finish?.usage
+  if (!usage || typeof usage !== 'object' || Array.isArray(usage)) return null
   return usage
+}
+
+/** 成功结束却没有有效 token 时，说明 usage 契约可能变了；每个平台×模型每分钟最多提醒一次。 */
+const warnedMissingUsage = new Map()
+
+function hasTokenUsage(usage) {
+  const tokens = normalizeUsage(usage)
+  return (
+    tokens.inputTokens + tokens.outputTokens + tokens.cacheReadTokens + tokens.cacheWriteTokens + tokens.reasoningTokens >
+    0
+  )
+}
+
+function warnMissingUsage(store, provider, model) {
+  const key = `${provider}\u0000${model}`
+  const now = Date.now()
+  if (now - (warnedMissingUsage.get(key) ?? 0) < 60_000) return
+  warnedMissingUsage.set(key, now)
+  store.logger?.warn?.(
+    `dsh-billing-statistics: ${provider}/${model} 成功结束但没有有效 usage，token 与花费会按 0 记录；请检查宿主 llm/stream 的 usage 契约。`,
+  )
 }
 
 /**
@@ -134,13 +199,21 @@ function captureAttempt(store, options, next) {
       try {
         const source = next()
         for await (const chunk of source) {
+          const type = typeof chunk?.type === 'string' ? chunk.type.toLowerCase() : ''
           // usage 可能出现在任意位置（一般是 finish 之前），始终记录。
-          if (chunk?.type === 'usage') usage = readUsage(chunk) ?? usage
-          else if (!sawTerminal && chunk?.type === 'finish') {
+          const nextUsage = readUsage(chunk)
+          if (nextUsage) usage = nextUsage
+          if (!sawTerminal && type === 'finish') {
             sawTerminal = true
             const reason = chunk.reason ?? chunk.finishReason
-            if (reason?.kind === 'error') outcome = 'failed'
-            else if (reason?.kind === 'aborted') outcome = 'aborted'
+            const kind =
+              typeof reason === 'string'
+                ? reason.toLowerCase()
+                : String(reason?.kind ?? reason?.type ?? '').toLowerCase()
+            if (kind === 'error') outcome = 'failed'
+            else if (kind === 'aborted') outcome = 'aborted'
+          } else if (type === 'error') {
+            outcome = 'failed'
           }
           yield chunk
         }
@@ -149,10 +222,13 @@ function captureAttempt(store, options, next) {
         throw error
       } finally {
         try {
+          // 历史数据尚未读完时不能记这一笔，否则 load() 会用盘上旧记录把它覆盖掉。
+          await store.whenReady?.()
+          if (outcome === 'ok' && !hasTokenUsage(usage)) warnMissingUsage(store, provider, model)
           store.recordCall({ provider, model, outcome, usage: usage ?? undefined })
         } catch (error) {
           // 记账绝不能影响模型调用本身。
-          store.logger?.warn?.(`llm-usage: 记账失败：${String(error?.message ?? error)}`)
+          store.logger?.warn?.(`dsh-billing-statistics: 记账失败：${String(error?.message ?? error)}`)
         }
       }
     },
@@ -190,10 +266,19 @@ function admitted(ctx, request) {
   if (connection && typeof connection.requestRejection === 'function') {
     try {
       const rejection = connection.requestRejection(request)
-      if (rejection !== undefined) return false
-      return true
-    } catch {
-      return false
+      // 当前契约是同步返回 undefined（允许）或状态码（拒绝）。若将来改成 Promise，
+      // 不能把 Promise 当成“已拒绝”而让整页 403；退回仅本机同源的保守判断。
+      if (rejection && typeof rejection.then === 'function') {
+        ctx.logger?.warn?.('dsh-billing-statistics: connection.requestRejection 返回了 Promise，退回本机同源校验。')
+        return sameOrigin(request)
+      }
+      return rejection === undefined
+    } catch (error) {
+      // 契约变化或临时异常时，至少不要让本机页面完全取不到数。
+      ctx.logger?.warn?.(
+        `dsh-billing-statistics: connection.requestRejection 异常，退回本机同源校验：${String(error?.message ?? error)}`,
+      )
+      return sameOrigin(request)
     }
   }
   return sameOrigin(request)
@@ -210,6 +295,63 @@ function parseDays(request) {
   } catch {
     return 7
   }
+}
+
+/** 单个日期参数：严格 YYYY-MM-DD，非法返回空串。 */
+function parseDay(value) {
+  const day = String(value ?? '').trim()
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return ''
+  const date = new Date(`${day}T00:00:00Z`)
+  if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== day) return ''
+  return day
+}
+
+/** 年份视图参数：0 表示未指定，合法范围 1970–2100。 */
+function parseYear(request) {
+  try {
+    const url = new URL(String(request.url ?? '/'), 'http://localhost')
+    const raw = Number(url.searchParams.get('year'))
+    if (!Number.isInteger(raw) || raw < 1970 || raw > 2100) return 0
+    return raw
+  } catch {
+    return 0
+  }
+}
+
+/** 是否包含时间明细；默认包含，显式 detail=0 时只导出汇总。 */
+function parseDetail(request) {
+  try {
+    const url = new URL(String(request.url ?? '/'), 'http://localhost')
+    return url.searchParams.get('detail') !== '0'
+  } catch {
+    return true
+  }
+}
+
+/** 收集导出需要的逐模型时间明细；detail=false 时调用方可跳过。 */
+function collectDetails(store, summary) {
+  const details = new Map()
+  for (const platform of summary.platforms) {
+    for (const model of platform.models) {
+      details.set(
+        `${platform.provider}/${model.model}`,
+        store.modelDetail({
+          provider: platform.provider,
+          model: model.model,
+          days: summary.kind === 'day' ? summary.days : 0,
+          year: summary.kind === 'month' ? summary.year : 0,
+        }),
+      )
+    }
+  }
+  return details
+}
+
+/** 导出共用的汇总 + 明细；detail=0 时不收集明细。 */
+function exportPayload(store, request) {
+  const summary = store.summary({ days: parseDays(request), year: parseYear(request) })
+  const detail = parseDetail(request)
+  return { summary, detail, details: detail ? collectDetails(store, summary) : new Map() }
 }
 
 /** 读一个小 JSON 请求体；超限或解析失败返回 null。 */
@@ -250,13 +392,17 @@ async function readJsonFile(file) {
 }
 
 async function writeJsonFile(file, payload) {
-  const temporary = `${file}.tmp`
-  await mkdir(dirname(file), { recursive: true })
-  await writeFile(temporary, JSON.stringify(payload), 'utf8')
-  await rename(temporary, file)
+  const temporary = `${file}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 10)}`
+  try {
+    await mkdir(dirname(file), { recursive: true })
+    await writeFile(temporary, JSON.stringify(payload), 'utf8')
+    await rename(temporary, file)
+  } finally {
+    await unlink(temporary).catch(() => {})
+  }
 }
 
-/** 今天（北京时间）；自动同步按这个粒度判断「今天抓过没有」。 */
+/** 数据时区偏移；自动同步按这个粒度判断「今天抓过没有」。 */
 function utcOffset(config) {
   return normalizeOffsetHours(config?.utcOffsetHours)
 }
@@ -265,56 +411,137 @@ function todayKey(config) {
   return beijingParts(Date.now(), utcOffset(config)).dayKey
 }
 
-/** 某个平台当前用的官网链接（手填 > 配置预设 > 已知平台默认页）。 */
-function sourceUrlFor(provider, { sources, config, names }) {
-  const stored = sources?.[provider]
-  if (stored?.url) return { url: stored.url, origin: stored.origin || 'manual' }
-  const preset = config?.priceFeeds?.[provider]
-  if (typeof preset === 'string' && preset.trim()) return { url: preset.trim(), origin: 'config' }
-  const known = knownFeedFor(provider, names?.[provider] ?? '')
-  if (known) return { url: known.url, origin: 'builtin' }
-  return { url: '', origin: '' }
+/** 把 models.dev 目录里的价格命中整理成页面用的来源信息。 */
+function catalogMeta(entry) {
+  if (!entry) return null
+  return {
+    provider: entry.catalogProvider ?? '',
+    providerName: entry.catalogProviderName ?? '',
+    model: entry.catalogModel ?? '',
+    matchKind: entry.matchKind ?? 'provider',
+    reference: entry.matchKind === 'reference',
+  }
 }
 
-/** 把自动搜索失败的原因归类，页面据此给用户可操作的提示。 */
-function classifySearchFailure(reason) {
-  const text = String(reason ?? '')
-  if (!text) return ''
-  if (/宿主未提供搜索服务|未提供搜索服务/.test(text)) return 'unavailable'
-  if (/no API key|DEEPSEEK_API_KEY|credential/i.test(text)) return 'credential'
-  if (/没有明确|未找到价格页/.test(text)) return 'no-result'
-  return 'failed'
+/** 人工价里的基础价（全天时段优先）。 */
+function manualBaseRate(entry) {
+  const periods = Array.isArray(entry?.periods) ? entry.periods : []
+  const full = periods.find((period) => (period.ranges ?? []).some(([from, to]) => from === 0 && to === 24))
+  return full?.rate ?? entry?.defaultRate ?? periods[periods.length - 1]?.rate ?? {}
 }
 
-/** 汇总当前价格状态（供页面显示每个平台的链接、来源与同步时间）。 */
-function priceReport({ snapshot, config, sources, providers, names }) {
+/** 人工价里的峰时价。 */
+function manualPeakRate(entry) {
+  const periods = Array.isArray(entry?.periods) ? entry.periods : []
+  const peak = periods.find(
+    (period) =>
+      String(period.label ?? '').startsWith('峰时') ||
+      (period.ranges ?? []).some(([from, to]) => !(from === 0 && to === 24)),
+  )
+  return peak?.rate ?? {}
+}
+
+/** 把人工导入价整理成「模型 → 单价」，供导入弹窗回填。 */
+function manualPriceRows(own) {
+  const rows = {}
+  for (const [model, entry] of Object.entries(own?.models ?? {})) {
+    const rate = manualBaseRate(entry)
+    const peak = manualPeakRate(entry)
+    rows[model] = {
+      input: Number(rate.input) || 0,
+      output: Number(rate.output) || 0,
+      cacheRead: Number(rate.cacheRead ?? rate.cache_read) || 0,
+      cacheWrite: Number(rate.cacheWrite ?? rate.cache_write) || 0,
+      peakInput: Number(peak.input) || 0,
+      peakOutput: Number(peak.output) || 0,
+      peakCacheRead: Number(peak.cacheRead ?? peak.cache_read) || 0,
+      peakCacheWrite: Number(peak.cacheWrite ?? peak.cache_write) || 0,
+    }
+  }
+  return rows
+}
+
+/** 某平台是否按 DeepSeek 官方 API 处理（明确 id 或已登记的官方 provider）。 */
+export function isOfficialPricingProvider(provider, officialProviders) {
+  return Boolean(officialProviders?.has?.(provider)) || isDeepSeekOfficialProvider({ provider })
+}
+
+/**
+ * 人工价是否应参与计价。
+ * 官方平台默认用官方自动价；只有用户在导入弹窗里显式保存过，旧人工价才转为覆盖。
+ */
+export function manualPriceIsActive(provider, own, officialProviders) {
+  if (!own) return false
+  return !isOfficialPricingProvider(provider, officialProviders) || own.officialOverride === true
+}
+
+/** 汇总当前价格状态（models.dev 命中、人工导入、官方自动价、同步时间）。 */
+export function priceReport({ snapshot, config, providers, names, manual, official, officialProviders, activeModels }) {
   const cached = snapshot?.providers ?? {}
+  const imported = manual?.providers ?? {}
   const errors = Array.isArray(snapshot?.errors) ? snapshot.errors : []
   const entries = providers.map((provider) => {
-    const source = sourceUrlFor(provider, { sources, config, names })
     const page = cached[provider]
+    const own = imported[provider]
+    const catalog = catalogMeta(page)
+    const pageModels = page?.models ? Object.keys(page.models) : []
+    const importedModels = own?.models ? Object.keys(own.models) : []
+    const isOfficial = isOfficialPricingProvider(provider, officialProviders)
+    const officialModels = isOfficial ? officialModelIds(official) : []
+    const modelCount = new Set([...pageModels, ...importedModels, ...officialModels]).size
+    const active = Array.isArray(activeModels?.[provider]) ? activeModels[provider] : []
+    const manualOverride = Boolean(isOfficial && own?.officialOverride === true)
+    const manualActive = manualPriceIsActive(provider, own, officialProviders)
+    const manualSet = new Set(manualActive ? importedModels : [])
+    const officialSet = new Set(officialModels)
+    const officialActive = active.filter((model) => officialSet.has(model))
+    // 人工价 / 官方价才算「这个平台自己的可靠价」；models.dev 目录价与跨平台参考价
+    // 都没有平台峰时窗口，仍需在价格条里提示人工确认。
+    const covered = (model) => manualSet.has(model) || officialSet.has(model)
+    const usingDefault = active.length > 0
+      ? active.some((model) => !covered(model))
+      : pageModels.some((model) => !covered(model))
     return {
       provider,
       title: names?.[provider] || provider,
-      url: page?.url || source.url,
-      origin: page?.origin || source.origin,
-      ok: Boolean(page?.ok),
-      missing: Boolean(page?.missing),
-      searchFailed: Boolean(page?.searchFailed),
-      searchReason: page?.searchReason ?? '',
-      searchCode: page?.searchCode ?? '',
+      origin: manualActive ? 'manual' : isOfficial ? 'official' : catalog ? 'catalog' : '',
+      ok: manualActive || isOfficial || Boolean(page?.ok),
+      missing: manualActive || isOfficial ? false : !page?.ok,
       error: page?.error ?? '',
-      feedId: page?.feedId ?? '',
-      currency: page?.currency ?? 'CNY',
-      models: page?.models ? Object.keys(page.models).length : 0,
-      fetchedAt: Number(page?.fetchedAt) || 0,
+      catalogProvider: catalog?.provider ?? '',
+      catalogProviderName: catalog?.providerName ?? '',
+      catalogModel: catalog?.model ?? '',
+      matchKind: catalog?.matchKind ?? '',
+      reference: Boolean(catalog?.reference),
+      currency: manualActive ? own?.currency : isOfficial ? 'USD' : page?.currency ?? 'CNY',
+      models: modelCount,
+      manualModels: manualActive ? importedModels.length : 0,
+      manualPrices: own ? manualPriceRows(own) : {},
+      peak: manualActive ? own?.peak : isOfficial ? official?.plan ?? null : null,
+      fetchedAt: manualActive
+        ? Number(own?.updatedAt) || 0
+        : isOfficial
+          ? Number(official?.fetchedAt) || 0
+          : Number(page?.fetchedAt) || 0,
+      manual: manualActive,
+      manualSaved: Boolean(own),
+      manualOverride,
+      official: isOfficial,
+      officialSource: isOfficial ? official?.source ?? 'builtin' : '',
+      officialFetchedAt: isOfficial ? Number(official?.fetchedAt) || 0 : 0,
+      officialModels: isOfficial ? officialActive.length || officialModels.length : 0,
+      officialModelList: officialModels,
+      activeModels: active,
+      usingDefault,
     }
   })
   const day = typeof snapshot?.day === 'string' ? snapshot.day : ''
   return {
     enabled: config?.priceSync !== false,
-    autoDiscover: config?.autoDiscover !== false,
-    fetchedAt: Number(snapshot?.fetchedAt) || 0,
+    source: CATALOG_SOURCE,
+    fetchedAt: Number(snapshot?.catalogFetchedAt) || 0,
+    catalogSource: snapshot?.catalogSource ?? '',
+    catalogError: snapshot?.catalogError ?? '',
     day,
     today: todayKey(config),
     syncedToday: day === todayKey(config),
@@ -325,131 +552,115 @@ function priceReport({ snapshot, config, sources, providers, names }) {
 }
 
 /**
- * 同步官网价格：按平台解析 → 写 prices.json → 重建计价器。
- * 单个平台失败时保留它上一次的价格；自动搜索失败的平台下次启动再试。
- * @param {{ ctx: any, config: any, file: string, sourcesFile: string, store: UsageStore, state: any }} input
+ * 同步 models.dev 价格：按平台 / 模型检索 → 写 prices.json → 重建计价器。
+ * @param {{ ctx: any, config: any, file: string, catalogFile: string, store: UsageStore, state: any }} input
  */
-function createPriceSync({ ctx, config, file, sourcesFile, store, state }) {
+function createPriceSync({ ctx, config, file, catalogFile, store, state }) {
   let running = null
 
-  const saveSource = async (provider, patch) => {
-    state.sources = {
-      ...(state.sources ?? {}),
-      [provider]: { ...(state.sources?.[provider] ?? {}), ...patch, updatedAt: Date.now() },
+  const refresh = async () => {
+    const result = await refreshCatalog({ cacheFile: catalogFile, logger: ctx.logger })
+    state.catalog = result.catalog
+    state.catalogSource = result.source
+    state.catalogError = result.error
+    if (result.error) {
+      ctx.logger?.warn?.(`dsh-billing-statistics: models.dev 在线刷新失败，使用 ${result.source}：${result.error}`)
     }
-    try {
-      await writeJsonFile(sourcesFile, { version: 1, sources: state.sources })
-    } catch (error) {
-      ctx.logger?.warn?.(`llm-usage: 保存平台链接失败：${String(error?.message ?? error)}`)
-    }
+    return result
   }
 
-  const clearSource = async (provider) => {
-    const next = { ...(state.sources ?? {}) }
-    delete next[provider]
-    state.sources = next
-    try {
-      await writeJsonFile(sourcesFile, { version: 1, sources: state.sources })
-    } catch (error) {
-      ctx.logger?.warn?.(`llm-usage: 清除平台链接失败：${String(error?.message ?? error)}`)
-    }
-  }
-
-  const run = async ({ only = null } = {}) => {
+  const run = async ({ only = null, forceRefresh = false } = {}) => {
     const names = store.platformNames()
     const modelsByProvider = store.providerModels()
-    // 只处理真正用过的平台，以及用户填过 / 配置里写过链接的平台；
-    // 不遍历整个 provider 目录（几十个没用过的平台会被无谓地抓一遍）。
+    // 只处理真正用过的平台与有手工价的平台。
     const active = new Set([
       ...Object.keys(modelsByProvider),
-      ...Object.keys(state.sources ?? {}),
-      ...Object.keys(config?.priceFeeds ?? {}),
+      ...Object.keys(state.manual?.providers ?? {}),
     ])
     state.providers = [...active]
-    const targets = [...active]
+
+    // 刷新按钮 / 每天首次同步都重新拉 models.dev；普通补抓复用内存目录。
+    if (forceRefresh || !state.catalog) await refresh()
+
     const previous = state.snapshot?.providers ?? {}
     const table = { ...previous }
     const errors = []
     let okNow = 0
 
-    for (const provider of targets) {
+    for (const provider of active) {
       if (only && !only.includes(provider)) continue
-      const { url: presetUrl, origin: presetOrigin } = sourceUrlFor(provider, {
-        sources: state.sources,
-        config,
-        names,
-      })
-      let url = presetUrl
-      let origin = presetOrigin
-      let searchFailure = ''
+      const modelIds = modelsByProvider[provider] ?? []
+      if (modelIds.length === 0) continue
 
-      if (!url && config?.autoDiscover !== false) {
-        let web
-        try {
-          web = ctx.get('web')
-        } catch {
-          web = undefined
+      const matched = {}
+      const missed = []
+      let first = null
+      let hasReference = false
+      for (const modelId of modelIds) {
+        const hit = lookupCatalogModel(state.catalog, {
+          provider,
+          displayName: names[provider] ?? '',
+          model: modelId,
+        })
+        if (!hit) {
+          missed.push(modelId)
+          continue
         }
-        const found = await discoverPriceUrl(web, provider, names[provider] ?? '')
-        if (found.url) {
-          url = found.url
-          origin = 'auto'
-          await saveSource(provider, { url, origin: 'auto', reason: found.reason })
-          ctx.logger?.info?.(`llm-usage: 为 ${provider} 自动填入价格页 ${url}（${found.reason}）`)
-        } else {
-          searchFailure = found.reason
-          errors.push({ provider, title: names[provider] || provider, message: `自动搜索未找到价格页：${found.reason}` })
-        }
+        if (!first) first = hit
+        if (hit.matchKind === 'reference') hasReference = true
+        matched[modelId] = catalogPriceEntry(hit, state.catalog?.fetchedAt ?? Date.now())
       }
 
-      if (!url) {
-        const stale = previous[provider] ?? {}
+      if (Object.keys(matched).length === 0) {
+        const message = `models.dev 未匹配到模型：${missed.slice(0, 4).join(', ')}`
+        errors.push({ provider, title: names[provider] || provider, message })
         table[provider] = {
-          ...stale,
+          ...(previous[provider] ?? {}),
           provider,
-          url: '',
-          origin,
+          origin: 'catalog',
           ok: false,
           missing: true,
-          error: '',
-          searchFailed: Boolean(searchFailure),
-          searchReason: searchFailure,
-          searchCode: classifySearchFailure(searchFailure),
-          models: stale.models ?? {},
-          fetchedAt: Number(stale.fetchedAt) || 0,
+          error: message,
+          models: {},
+          currency: 'USD',
+          fetchedAt: state.catalog?.fetchedAt ?? 0,
         }
         continue
       }
 
-      try {
-        const page = await fetchPricePage({ url }, { modelIds: modelsByProvider[provider] ?? [] })
-        okNow += 1
-        table[provider] = {
+      okNow += 1
+      table[provider] = {
+        provider,
+        origin: 'catalog',
+        catalogProvider: first?.provider ?? '',
+        catalogProviderName: first?.providerName ?? '',
+        catalogModel: first?.id ?? '',
+        matchKind: hasReference ? 'reference' : 'provider',
+        currency: 'USD',
+        fetchedAt: state.catalog?.fetchedAt ?? Date.now(),
+        ok: true,
+        missing: false,
+        error: missed.length > 0 ? `未匹配：${missed.slice(0, 4).join(', ')}` : '',
+        models: matched,
+        aliases: {},
+      }
+      if (missed.length > 0) {
+        errors.push({
           provider,
-          url,
-          origin,
-          feedId: page.feedId,
-          currency: page.currency,
-          fetchedAt: page.fetchedAt,
-          ok: true,
-          error: '',
-          models: page.models,
-          aliases: page.aliases,
-        }
-      } catch (error) {
-        const message = String(error?.message ?? error)
-        errors.push({ provider, title: names[provider] || provider, message })
-        ctx.logger?.warn?.(`llm-usage: 价格同步失败（${provider}）：${message}`)
-        // 失败保留上一次该平台的价格，避免整页掉价。
-        table[provider] = { ...(previous[provider] ?? {}), provider, url, origin, ok: false, error: message }
+          title: names[provider] || provider,
+          message: `部分模型未匹配：${missed.slice(0, 4).join(', ')}`,
+        })
       }
     }
 
     const anyOk = okNow > 0
     const snapshot = {
-      version: 2,
-      fetchedAt: anyOk ? Date.now() : Number(state.snapshot?.fetchedAt) || 0,
+      version: 3,
+      fetchedAt: Date.now(),
       day: anyOk ? todayKey(config) : (state.snapshot?.day ?? ''),
+      catalogFetchedAt: Number(state.catalog?.fetchedAt) || 0,
+      catalogSource: state.catalogSource ?? '',
+      catalogError: state.catalogError ?? '',
       providers: table,
       errors: errors.slice(0, 12),
     }
@@ -457,10 +668,19 @@ function createPriceSync({ ctx, config, file, sourcesFile, store, state }) {
     try {
       await writeJsonFile(file, snapshot)
     } catch (error) {
-      ctx.logger?.warn?.(`llm-usage: 写入价格表失败：${String(error?.message ?? error)}`)
+      ctx.logger?.warn?.(`dsh-billing-statistics: 写入价格表失败：${String(error?.message ?? error)}`)
     }
     rebuildPricer({ config, state, store })
-    return priceReport({ snapshot, config, sources: state.sources, providers: state.providers, names })
+    return priceReport({
+      snapshot,
+      config,
+      providers: state.providers,
+      names,
+      manual: state.manual,
+      official: state.official,
+      officialProviders: state.officialProviders,
+      activeModels: store.providerModels(),
+    })
   }
 
   const sync = async (options) => {
@@ -470,8 +690,7 @@ function createPriceSync({ ctx, config, file, sourcesFile, store, state }) {
     })
     return running
   }
-  sync.saveSource = saveSource
-  sync.clearSource = clearSource
+  sync.refresh = refresh
   return sync
 }
 
@@ -482,10 +701,46 @@ function rebuildPricer({ config, state, store }) {
     if (!page?.models || Object.keys(page.models).length === 0) continue
     providers[provider] = {
       models: page.models,
-      currency: page.currency ?? 'CNY',
+      currency: page.currency ?? 'USD',
       aliases: page.aliases ?? {},
-      url: page.url ?? '',
-      feedId: page.feedId ?? '',
+      url: '',
+      feedId: page.catalogProvider ?? '',
+      source: 'catalog',
+    }
+  }
+  // DeepSeek 官方 API：官方价优先于 models.dev / 跨平台参考价，仅次于人工导入。
+  // 官方价只写进“官方 provider”的表里，绝不扩到 siliconflow 等第三方平台。
+  const officialProviders = new Set(state.officialProviders ?? [])
+  for (const provider of [...Object.keys(providers), ...Object.keys(state.manual?.providers ?? {})]) {
+    if (isDeepSeekOfficialProvider({ provider })) officialProviders.add(provider)
+  }
+  const officialModels = officialProviderModels(state.official)
+  for (const provider of officialProviders) {
+    const base = providers[provider] ?? { models: {}, currency: 'USD' }
+    providers[provider] = {
+      ...base,
+      models: { ...(base.models ?? {}), ...officialModels },
+      currency: 'USD',
+      source: 'official',
+      feedId: '',
+      url: OFFICIAL_PRICING_PAGE,
+      official: true,
+    }
+  }
+  // 人工导入的价格单独持久化，models.dev 同步不会覆盖；同名模型默认以人工导入为准。
+  // DeepSeek 官方 API 例外：旧版遗留的人工价默认收起，只有用户显式保存覆盖才生效。
+  for (const [provider, own] of Object.entries(state.manual?.providers ?? {})) {
+    if (!own?.models || Object.keys(own.models).length === 0) continue
+    const manualProviderIsOfficial = isOfficialPricingProvider(provider, officialProviders)
+    if (manualProviderIsOfficial && own.officialOverride !== true) continue
+    providers[provider] = {
+      ...(providers[provider] ?? {}),
+      models: { ...(providers[provider]?.models ?? {}), ...own.models },
+      currency: own.currency ?? 'CNY',
+      aliases: providers[provider]?.aliases ?? {},
+      url: '',
+      feedId: 'manual',
+      source: providers[provider]?.source ?? 'catalog',
     }
   }
   const pricer = createPricer({
@@ -505,11 +760,38 @@ function rebuildPricer({ config, state, store }) {
  * @param {object} config
  */
 export function apply(ctx, config) {
+  if (!Schema) {
+    ctx.logger?.warn?.(
+      `dsh-billing-statistics: schemastery 不可用或 API 不兼容，已省略 Config schema；插件继续按现有配置运行：${String(schemaLoad.error?.message ?? schemaLoad.error)}`,
+    )
+  }
   const directory = dataDirectory()
   const priceFile = join(directory, 'prices.json')
-  const sourcesFile = join(directory, 'sources.json')
-  /** 共享的可变状态：价格快照、平台链接、provider 列表。 */
-  const state = { snapshot: null, sources: {}, providers: [] }
+  const manualFile = join(directory, 'manual-prices.json')
+  const catalogFile = join(directory, 'models-dev.json')
+  /** 共享的可变状态：models.dev 目录、价格快照、人工导入、provider 列表。 */
+  const state = {
+    snapshot: null,
+    catalog: null,
+    catalogSource: '',
+    catalogError: '',
+    manual: { version: 1, providers: {} },
+    providers: [],
+    official: builtinOfficialPricing(),
+    officialProviders: new Set(),
+    officialError: '',
+  }
+  // 启动时人工价文件是异步读取的；接口先等它加载完，避免刚打开页面就导入时
+  // 旧文件又把新导入覆盖掉。
+  let resolveManualReady
+  const manualReady = new Promise((resolve) => {
+    resolveManualReady = resolve
+  })
+
+  const providerEntries = providerDirectory(ctx)
+  for (const entry of providerEntries) {
+    if (entry?.provider && isDeepSeekOfficialProvider(entry)) state.officialProviders.add(entry.provider)
+  }
 
   const store = new UsageStore({
     directory,
@@ -524,33 +806,141 @@ export function apply(ctx, config) {
     showCost: config?.showCost !== false,
     logger: ctx.logger,
   })
+  // 尽早开始读盘；流钩子会在记账前等待它，避免启动瞬间的调用被 load() 覆盖。
+  const storeReady = store.load()
 
-  const syncPrices = createPriceSync({ ctx, config, file: priceFile, sourcesFile, store, state })
+  const syncPrices = createPriceSync({ ctx, config, file: priceFile, catalogFile, store, state })
+
+  /**
+   * 读取 DeepSeek 官方价。失败时 getOfficialPricing 会退回缓存/内置表，
+   * 因此这里永远不会因为官网打不开而让接口 500；错误只作为提示返回页面。
+   */
+  const refreshOfficialPricing = async ({ force = false } = {}) => {
+    const data = await getOfficialPricing({ force })
+    state.official = data
+    state.officialError = data.error ?? ''
+    rebuildPricer({ config, state, store })
+    return data
+  }
+
+  const officialPayload = (provider = '') => ({
+    ok: true,
+    provider,
+    currency: 'USD',
+    source: state.official?.source ?? 'builtin',
+    fetchedAt: state.official?.fetchedAt ?? 0,
+    error: state.officialError ?? '',
+    url: state.official?.url ?? OFFICIAL_PRICING_PAGE,
+    models: officialModelIds(state.official),
+    rows: officialPriceRows(state.official),
+    plan: officialPlanForOffset(utcOffset(config)),
+  })
+
+  /** 保存人工导入价格；只覆盖填写的模型，未填写的旧人工价保留。 */
+  const importManualPrices = async (provider, models, currency = 'CNY', rawPeak = null, officialOverride = false) => {
+    await manualReady
+    const peak = normalizeManualPeak(rawPeak)
+    const normalized = normalizeManualPriceModels(models, { currency, peak })
+    const previous = retimeManualPriceModels(state.manual?.providers?.[provider]?.models ?? {}, peak)
+    const isOfficial = isOfficialPricingProvider(provider, state.officialProviders)
+    if (isOfficial) state.officialProviders.add(provider)
+    const next = {
+      ...(state.manual?.providers ?? {}),
+      [provider]: {
+        provider,
+        currency: currency === 'USD' ? 'USD' : 'CNY',
+        peak,
+        models: mergeManualPriceModels(previous, normalized),
+        updatedAt: Date.now(),
+        // 只有用户显式保存过，才允许人工价覆盖 DeepSeek 官方自动价；
+        // 旧版遗留的人工价默认收起，避免官方 API 仍显示“人工导入”。
+        officialOverride: Boolean(isOfficial && officialOverride),
+      },
+    }
+    state.manual = { version: 1, providers: next }
+    await writeJsonFile(manualFile, state.manual)
+    if (!state.providers.includes(provider)) state.providers.push(provider)
+    rebuildPricer({ config, state, store })
+    return priceReport({
+      snapshot: state.snapshot,
+      config,
+      providers: state.providers,
+      names: store.platformNames(),
+      manual: state.manual,
+      official: state.official,
+      officialProviders: state.officialProviders,
+      activeModels: store.providerModels(),
+    })
+  }
+
+  /** 移除某平台的人工价覆盖，让官方 API 回到官方自动价。 */
+  const clearManualPrices = async (provider) => {
+    await manualReady
+    if (state.manual?.providers?.[provider]) {
+      const providers = { ...state.manual.providers }
+      delete providers[provider]
+      state.manual = { version: 1, providers }
+      await writeJsonFile(manualFile, state.manual)
+    }
+    rebuildPricer({ config, state, store })
+    return priceReport({
+      snapshot: state.snapshot,
+      config,
+      providers: state.providers,
+      names: store.platformNames(),
+      manual: state.manual,
+      official: state.official,
+      officialProviders: state.officialProviders,
+      activeModels: store.providerModels(),
+    })
+  }
 
   ctx.effect(() => {
     let disposed = false
     void (async () => {
-      await store.load()
+      await storeReady
       state.providers = [
-        ...new Set([...Object.keys(store.providerModels()), ...Object.keys(config?.priceFeeds ?? {})]),
+        ...new Set([
+          ...Object.keys(store.providerModels()),
+          ...Object.keys(state.manual.providers),
+        ]),
       ]
+      // 历史数据里可能还有目录未登记的官方 provider id；出现即纳入官方价。
+      for (const provider of state.providers) {
+        if (isDeepSeekOfficialProvider({ provider })) state.officialProviders.add(provider)
+      }
       state.snapshot = await readJsonFile(priceFile)
-      const savedSources = await readJsonFile(sourcesFile)
-      state.sources = savedSources?.sources && typeof savedSources.sources === 'object' ? savedSources.sources : {}
+      // 旧版 prices.json 是官网解析结果，来源不同；等这次 models.dev 同步重建。
+      if (state.snapshot && state.snapshot.version !== 3) state.snapshot = null
+      const savedManual = await readJsonFile(manualFile)
+      state.manual = savedManual?.providers && typeof savedManual.providers === 'object'
+        ? { version: 1, providers: savedManual.providers }
+        : { version: 1, providers: {} }
+      resolveManualReady?.()
+      const loaded = await loadCatalog({ cacheFile: catalogFile })
+      state.catalog = loaded.catalog
+      state.catalogSource = loaded.source
+      state.catalogError = loaded.error
       rebuildPricer({ config, state, store })
-      ctx.logger?.info?.(`llm-usage: 计量已就绪，数据目录 ${store.directory}`)
+      if (state.officialProviders.size > 0) {
+        void refreshOfficialPricing().catch((error) => {
+          ctx.logger?.warn?.(`dsh-billing-statistics: DeepSeek 官方价读取失败：${String(error?.message ?? error)}`)
+        })
+      }
+      ctx.logger?.info?.(`dsh-billing-statistics: 计量已就绪，数据目录 ${store.directory}`)
       if (config?.priceSync === false) return
-      // 每天自动抓一次：今天没抓过（含「当时程序没开」）就在启动时补上。
-      if (state.snapshot?.day !== todayKey(config)) {
-        void syncPrices().catch((error) => {
-          ctx.logger?.warn?.(`llm-usage: 启动时同步价格失败：${String(error?.message ?? error)}`)
+      // 每天自动刷新一次 models.dev；今天没刷新过（含当时程序没开）就补上。
+      if (state.snapshot?.day !== todayKey(config) || !state.catalog) {
+        void syncPrices({ forceRefresh: true }).catch((error) => {
+          ctx.logger?.warn?.(`dsh-billing-statistics: 启动时同步价格失败：${String(error?.message ?? error)}`)
         })
       }
     })()
       .catch((error) => {
-        ctx.logger?.warn?.(`llm-usage: 初始化失败：${String(error?.message ?? error)}`)
+        ctx.logger?.warn?.(`dsh-billing-statistics: 初始化失败：${String(error?.message ?? error)}`)
       })
       .finally(() => {
+        resolveManualReady?.()
         if (disposed) void store.close()
       })
 
@@ -558,8 +948,8 @@ export function apply(ctx, config) {
     const dailyTimer = setInterval(() => {
       if (config?.priceSync === false) return
       if (state.snapshot?.day === todayKey(config)) return
-      void syncPrices().catch((error) => {
-        ctx.logger?.warn?.(`llm-usage: 每日同步价格失败：${String(error?.message ?? error)}`)
+      void syncPrices({ forceRefresh: true }).catch((error) => {
+        ctx.logger?.warn?.(`dsh-billing-statistics: 每日同步价格失败：${String(error?.message ?? error)}`)
       })
     }, 30 * 60 * 1000)
     dailyTimer.unref?.()
@@ -572,7 +962,24 @@ export function apply(ctx, config) {
   })
 
   ctx.effect(() => {
-    const off = ctx.on('llm/stream', (options, next) => captureAttempt(store, options, next))
+    /** 该平台是否已有可用的 models.dev 价表（有价且不是失败态）。 */
+    const pricedProvider = (provider) => {
+      const page = state.snapshot?.providers?.[provider]
+      return Boolean(page && page.ok !== false && page.models && Object.keys(page.models).length > 0)
+    }
+    const asked = new Set()
+    const off = ctx.on('llm/stream', (options, next) => {
+      // 新平台当天首次出现时补检索一次 models.dev；已有价表则跳过。
+      const provider = String(options?.provider ?? '')
+      const key = provider + '|' + todayKey(config)
+      if (provider && provider !== 'unknown' && !asked.has(key) && !pricedProvider(provider)) {
+        asked.add(key)
+        void syncPrices({ only: [provider] }).catch((error) => {
+          ctx.logger?.warn?.('dsh-billing-statistics: 补检索平台价格失败（' + provider + '）：' + String(error?.message ?? error))
+        })
+      }
+      return captureAttempt(store, options, next)
+    })
     return () => off?.()
   })
 
@@ -584,13 +991,31 @@ export function apply(ctx, config) {
           return
         }
         const pathname = new URL(String(request.url ?? '/'), 'http://localhost').pathname
+        if (pathname === PRICES_OFFICIAL_PATH) {
+          if (request.method !== 'GET') {
+            response.writeHead(405, { allow: 'GET' })
+            response.end()
+            return
+          }
+          const query = new URL(String(request.url ?? '/'), 'http://localhost').searchParams
+          const provider = String(query.get('provider') ?? '')
+          try {
+            await refreshOfficialPricing({ force: query.get('refresh') === '1' })
+          } catch (error) {
+            // refreshOfficialPricing 正常不会抛；这里再兜一层，页面拿到内置表而不是 500。
+            ctx.logger?.warn?.(`dsh-billing-statistics: 官方价接口失败：${String(error?.message ?? error)}`)
+          }
+          sendJson(response, 200, officialPayload(provider))
+          return
+        }
         if (pathname === SUMMARY_PATH) {
           if (request.method !== 'GET') {
             response.writeHead(405, { allow: 'GET' })
             response.end()
             return
           }
-          const summary = store.summary({ days: parseDays(request) })
+          const summary = store.summary({ days: parseDays(request), year: parseYear(request) })
+          const activeModels = store.providerModels()
           // 未定价模型标记出来，页面据此提示「花费只统计已定价的部分」。
           // 用 provider/model 形式，正好可以照抄进配置的 pricing。
           const unpriced = summary.platforms.flatMap((platform) =>
@@ -599,7 +1024,11 @@ export function apply(ctx, config) {
               .map((model) => `${platform.provider}/${model.model}`),
           )
           const providers = [
-            ...new Set([...summary.platforms.map((platform) => platform.provider), ...Object.keys(state.sources ?? {})]),
+            ...new Set([
+              ...summary.platforms.map((platform) => platform.provider),
+              ...Object.keys(state.manual?.providers ?? {}),
+              ...state.providers,
+            ]),
           ]
           sendJson(response, 200, {
             ok: true,
@@ -608,20 +1037,60 @@ export function apply(ctx, config) {
             prices: priceReport({
               snapshot: state.snapshot,
               config,
-              sources: state.sources,
               providers,
               names: store.platformNames(),
+              manual: state.manual,
+              official: state.official,
+              officialProviders: state.officialProviders,
+              activeModels,
             }),
           })
           return
         }
-        if (pathname === EXPORT_PATH) {
+        if (pathname === EXPORT_REPORT_PATH) {
           if (request.method !== 'GET' && request.method !== 'HEAD') {
             response.writeHead(405, { allow: 'GET' })
             response.end()
             return
           }
-          const csv = buildCsv(store.summary({ days: parseDays(request) }), { generatedAt: Date.now() })
+          const { summary, detail, details } = exportPayload(store, request)
+          const html = buildReport(summary, { generatedAt: Date.now(), details, detail })
+          response.writeHead(200, {
+            'content-type': 'text/html; charset=utf-8',
+            'content-disposition': `attachment; filename="llm-usage-${todayKey(config)}.html"`,
+            'cache-control': 'no-store',
+          })
+          response.end(request.method === 'HEAD' ? undefined : html)
+          return
+        }
+        if (pathname === EXPORT_PDF_PATH) {
+          if (request.method !== 'GET' && request.method !== 'HEAD') {
+            response.writeHead(405, { allow: 'GET' })
+            response.end()
+            return
+          }
+          try {
+            const { summary, detail, details } = exportPayload(store, request)
+            const pdf = await buildPdf(summary, { generatedAt: Date.now(), details, detail })
+            response.writeHead(200, {
+              'content-type': 'application/pdf',
+              'content-disposition': `attachment; filename="llm-usage-${todayKey(config)}.pdf"`,
+              'cache-control': 'no-store',
+            })
+            response.end(request.method === 'HEAD' ? undefined : pdf)
+          } catch (error) {
+            ctx.logger?.warn?.(`dsh-billing-statistics: PDF 导出失败：${String(error?.message ?? error)}`)
+            sendJson(response, 500, { ok: false, error: String(error?.message ?? error) })
+          }
+          return
+        }
+        if (pathname === EXPORT_CSV_PATH) {
+          if (request.method !== 'GET' && request.method !== 'HEAD') {
+            response.writeHead(405, { allow: 'GET' })
+            response.end()
+            return
+          }
+          const csv = buildCsv(store.summary({ days: parseDays(request), year: parseYear(request) }), { generatedAt: Date.now() })
           response.writeHead(200, {
             'content-type': 'text/csv; charset=utf-8',
             'content-disposition': `attachment; filename="llm-usage-${todayKey(config)}.csv"`,
@@ -654,8 +1123,24 @@ export function apply(ctx, config) {
             sendJson(response, 400, { error: 'provider-and-model-required' })
             return
           }
-          const detail = store.modelDetail({ provider, model, days: parseDays(request) })
+          const detail = store.modelDetail({ provider, model, days: parseDays(request), year: parseYear(request) })
           sendJson(response, 200, { ok: true, ...detail })
+          return
+        }
+        if (pathname === RECONCILE_PATH) {
+          if (request.method !== 'GET') {
+            response.writeHead(405, { allow: 'GET' })
+            response.end()
+            return
+          }
+          const query = new URL(String(request.url ?? '/'), 'http://localhost').searchParams
+          const requested = String(query.get('day') ?? '').trim()
+          const day = requested ? parseDay(requested) : todayKey(config)
+          if (!day) {
+            sendJson(response, 400, { error: 'invalid-day' })
+            return
+          }
+          sendJson(response, 200, { ok: true, ...store.dayTotals(day) })
           return
         }
         if (pathname === PRICES_PATH) {
@@ -665,16 +1150,22 @@ export function apply(ctx, config) {
             return
           }
           state.providers = [
-            ...new Set([...Object.keys(store.providerModels()), ...Object.keys(state.sources ?? {})]),
+            ...new Set([
+              ...Object.keys(store.providerModels()),
+              ...Object.keys(state.manual?.providers ?? {}),
+            ]),
           ]
           sendJson(response, 200, {
             ok: true,
             prices: priceReport({
               snapshot: state.snapshot,
               config,
-              sources: state.sources,
               providers: state.providers,
               names: store.platformNames(),
+              manual: state.manual,
+              official: state.official,
+              officialProviders: state.officialProviders,
+              activeModels: store.providerModels(),
             }),
           })
           return
@@ -685,36 +1176,64 @@ export function apply(ctx, config) {
             response.end()
             return
           }
-          const report = await syncPrices()
+          const report = await syncPrices({ forceRefresh: true })
           sendJson(response, 200, { ok: true, prices: report })
           return
         }
-        if (pathname === SOURCES_PATH) {
+        if (pathname === PRICES_IMPORT_PATH) {
           if (request.method !== 'POST') {
             response.writeHead(405, { allow: 'POST' })
             response.end()
             return
           }
-          const body = await readJsonBody(request)
+          const body = await readJsonBody(request, 262144)
           const provider = typeof body?.provider === 'string' ? body.provider.trim() : ''
-          const url = typeof body?.url === 'string' ? body.url.trim() : ''
-          if (!provider) {
+          const currency = body?.currency === 'USD' ? 'USD' : 'CNY'
+          if (!body || !provider) {
             sendJson(response, 400, { error: 'provider-required' })
             return
           }
-          if (url && !/^https?:\/\//i.test(url)) {
-            sendJson(response, 400, { error: 'invalid-url' })
+          const isOfficial = isOfficialPricingProvider(provider, state.officialProviders)
+          if (body.clear === true) {
+            if (!isOfficial) {
+              sendJson(response, 400, { error: 'official-only', message: '只有 DeepSeek 官方平台可恢复自动价' })
+              return
+            }
+            try {
+              const report = await clearManualPrices(provider)
+              sendJson(response, 200, { ok: true, prices: report })
+            } catch (error) {
+              sendJson(response, 500, { error: 'clear-failed', message: String(error?.message ?? error) })
+            }
             return
           }
-          if (url) await syncPrices.saveSource(provider, { url, origin: 'manual', reason: '手动填写' })
-          else await syncPrices.clearSource(provider)
-          const report = await syncPrices({ only: [provider] })
-          sendJson(response, 200, { ok: true, prices: report })
+          if (!body.models || typeof body.models !== 'object') {
+            sendJson(response, 400, { error: 'invalid-prices', message: '缺少模型价格表' })
+            return
+          }
+          try {
+            const hasPeak = Object.prototype.hasOwnProperty.call(body, 'peak')
+            const peak = hasPeak
+              ? normalizeManualPeak(body.peak)
+              : state.manual?.providers?.[provider]?.peak ?? null
+            const report = await importManualPrices(
+              provider,
+              body.models,
+              currency,
+              peak,
+              // 新版弹窗会显式带 true/false；旧版客户端没有这个字段，
+              // 但用户点保存就是想要人工覆盖，按 true 兼容。
+              isOfficial && body.officialOverride !== false,
+            )
+            sendJson(response, 200, { ok: true, prices: report })
+          } catch (error) {
+            sendJson(response, 400, { error: 'invalid-prices', message: String(error?.message ?? error) })
+          }
           return
         }
         sendJson(response, 404, { error: 'not-found' })
       } catch (error) {
-        ctx.logger?.warn?.(`llm-usage: 路由处理失败：${String(error?.message ?? error)}`)
+        ctx.logger?.warn?.(`dsh-billing-statistics: 路由处理失败：${String(error?.message ?? error)}`)
         try {
           sendJson(response, 500, { error: 'internal-error' })
         } catch {
@@ -723,12 +1242,13 @@ export function apply(ctx, config) {
       }
     }
     const disposes = []
-    try {
-      for (const path of [SUMMARY_PATH, EXPORT_PATH, RESET_PATH, MODEL_PATH, PRICES_PATH, PRICES_SYNC_PATH, SOURCES_PATH]) {
+    for (const path of ROUTES) {
+      // 单个路由被占用或宿主契约变化时，保留其余接口，不要整组放弃。
+      try {
         disposes.push(ctx.webServer.register({ kind: 'exact', path, handler }))
+      } catch (error) {
+        ctx.logger?.warn?.(`dsh-billing-statistics: 注册接口失败（${path}）：${String(error?.message ?? error)}`)
       }
-    } catch (error) {
-      ctx.logger?.warn?.(`llm-usage: 注册接口失败：${String(error?.message ?? error)}`)
     }
     return () => {
       for (const dispose of disposes) {

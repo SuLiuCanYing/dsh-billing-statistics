@@ -1,11 +1,10 @@
-# llm-usage-insights bundle: 采集模型调用计量并在侧栏提供一个统计页。
+# dsh-billing-statistics bundle: 采集模型调用计量并在侧栏提供计费统计页面。
 - insert:
-    - id: llm-usage
-      name: 'llm-usage-insights'
+    - id: dsh-billing-statistics
+      name: 'dsh-billing-statistics'
       config:
         retainDays: 30
         showCost: true
-        # 官网价格：每天自动同步一次（当天没开程序则下次启动补抓）；
-        # 平台没填官网链接时自动搜索填，页面里每个平台后面也能手改。
+        # models.dev 价格目录：每天自动刷新一次（当天没开程序则下次启动补刷）。
+        # 匹配不到的模型在页面里用「人工导入价格」直接填。
         priceSync: true
-        autoDiscover: true
