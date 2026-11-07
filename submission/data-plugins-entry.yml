@@ -2,7 +2,7 @@ url: https://github.com/SuLiuCanYing/dsh-billing-statistics
 name: SuLiuCanYing/dsh-billing-statistics
 category: usage
 description:
-  en: 'Local billing ledger for DSH model calls: provider/model call counts, tokens and estimated spend, official-bill comparison, manual price imports with peak windows, and HTML/PDF reports.'
-  zh: 'DSH 模型调用的本地计费账本：按平台/模型汇总调用次数、token 与估算花费，支持官方账单对比、人工价格导入（含峰时价）与 HTML/PDF 报表。'
+  en: 'Full-featured local billing dashboard for DSH model calls: multi-platform provider/model breakdowns of calls, tokens and spend, peak/off-peak pricing, manual CSV price import with peak windows, official-bill reconciliation, and HTML/PDF/CSV export.'
+  zh: '功能齐全的 DSH 本地计费面板：多平台、按平台/模型明细汇总调用次数、token 与花费，支持峰谷/阶梯计价、CSV 人工导入价格（含峰时窗口）、官方账单对齐，以及 HTML/PDF/CSV 导出。'
 icon: https://raw.githubusercontent.com/SuLiuCanYing/dsh-billing-statistics/main/assets/icon-180.png
 tarball: https://github.com/SuLiuCanYing/dsh-billing-statistics/releases/latest/download/dsh-billing-statistics.tgz
