@@ -1,6 +1,6 @@
 # dsh-billing-statistics
 
-Full-featured local billing dashboard for DSH model calls: multi-platform provider/model breakdowns of calls, tokens and spend, peak/off-peak pricing, manual CSV price import with peak windows, official-bill reconciliation, and HTML/PDF/CSV export.
+Local billing dashboard for DSH model calls: multi-platform provider/model breakdowns of calls, tokens and spend, peak/off-peak pricing, manual CSV price import with peak windows, official-bill reconciliation, and HTML/PDF/CSV export.
 
 - Aggregates calls, failures, aborts, input / output / cache tokens and cost by **provider → model**.
 - Cost uses **peak / off-peak windows** and **tiered pricing**; windows default to UTC+8 (`utcOffsetHours` configurable).
