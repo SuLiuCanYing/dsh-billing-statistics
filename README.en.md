@@ -1,6 +1,6 @@
 # dsh-billing-statistics
 
-Per-provider, per-model usage and billing accounting for DeepSeek Harness: calls, tokens, estimated cost — all local, one click from the sidebar.
+Full-featured local billing dashboard for DSH model calls: multi-platform provider/model breakdowns of calls, tokens and spend, peak/off-peak pricing, manual CSV price import with peak windows, official-bill reconciliation, and HTML/PDF/CSV export.
 
 - Aggregates calls, failures, aborts, input / output / cache tokens and cost by **provider → model**.
 - Cost uses **peak / off-peak windows** and **tiered pricing**; windows default to UTC+8 (`utcOffsetHours` configurable).
@@ -31,7 +31,7 @@ Per-provider, per-model usage and billing accounting for DeepSeek Harness: calls
 
 ## Install
 
-Not in the plugin market yet; install it as a local development plugin, then restart the app and open the sidebar entry.
+Install from a local directory, then restart the app and open the sidebar entry.
 
 Compatibility: DSH `>=0.2.1-rc.5 <0.3.0`, Node.js `>=20`; currently verified on Windows 11 with DSH `0.2.1-rc.5` only. See [PLUGIN-DECLARATION.md](PLUGIN-DECLARATION.md) for the full compatibility, permission, and limitation statement.
 
